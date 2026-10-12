@@ -1,0 +1,38 @@
+{
+  "name": "work-load-understand",
+  "version": "1.0.0",
+  "description": "Understand any git change set: AI-agent-ready diffs, Gemini explanations, secret and bad-practice detection, PR descriptions, release notes and issue reports. CLI and local web UI.",
+  "type": "module",
+  "bin": {
+    "work_load_understand": "bin/wlu.js",
+    "work-load-understand": "bin/wlu.js",
+    "wlu": "bin/wlu.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "prompts",
+    "web",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/wlu.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "keywords": [
+    "git",
+    "diff",
+    "code-review",
+    "gemini",
+    "pull-request",
+    "release-notes",
+    "secret-scanning",
+    "ai-agents",
+    "cli"
+  ],
+  "license": "MIT"
+}

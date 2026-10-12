@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Run work_load_understand without installing: ~/work_load_understand/wlu ./my-repo
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec node "$DIR/bin/wlu.js" "$@"
