@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>work_load_understand</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">wlu</span>
+      <div class="repo">
+        <strong id="repo-name">Loading</strong>
+        <span id="repo-meta" class="muted"></span>
+      </div>
+    </div>
+    <div class="compare">
+      <label for="mode">Compare</label>
+      <select id="mode">
+        <option value="worktree">Uncommitted vs HEAD</option>
+        <option value="staged">Staged only</option>
+        <option value="base">Branch vs base</option>
+      </select>
+      <input id="base" list="refs" placeholder="main" spellcheck="false" autocomplete="off" hidden>
+      <datalist id="refs"></datalist>
+      <button id="refresh" class="btn">Refresh</button>
+    </div>
+    <div class="actions">
+      <span id="ai-status" class="pill"></span>
+      <button id="copy-agent" class="btn" title="Copy the redacted, annotated diff for AI agents">Copy diff for agents</button>
+      <button id="download-agent" class="btn">Download .md</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div id="summary" class="summary"></div>
+      <input id="filter" class="filter" placeholder="Filter files" spellcheck="false">
+      <ul id="file-list" class="file-list"></ul>
+    </aside>
+
+    <main class="main">
+      <nav class="tabs" id="tabs">
+        <button data-tab="changes" class="tab active">Changes</button>
+        <button data-tab="warnings" class="tab">Warnings <span class="count" id="warn-count"></span></button>
+        <button data-tab="internal" class="tab">Internal Dev Description</button>
+        <button data-tab="client" class="tab">Client Release</button>
+        <button data-tab="issues" class="tab">Issues and Suggestions</button>
+        <button data-tab="prompts" class="tab">Prompts</button>
+      </nav>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
