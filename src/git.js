@@ -2,10 +2,12 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { parseUnifiedDiff } from './diffParser.js';
+import { previewKind } from './preview.js';
 import { mapLimit } from './util.js';
 
 const MAX_UNTRACKED_FILES = 1000;
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
+export const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 
 function git(cwd, args, okCodes = [0]) {
   return new Promise((resolve, reject) => {
@@ -23,6 +25,17 @@ function git(cwd, args, okCodes = [0]) {
         if (typeof err.code === 'number' && okCodes.includes(err.code)) return resolve(stdout);
         reject(new Error(`git ${args.join(' ')} failed: ${(stderr || err.message).trim()}`));
       },
+    );
+  });
+}
+
+function gitBuffer(cwd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'git',
+      args,
+      { cwd, encoding: 'buffer', maxBuffer: MAX_PREVIEW_BYTES + 1024, env: { ...process.env, GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' } },
+      (err, stdout, stderr) => (err ? reject(new Error(`git ${args.join(' ')} failed: ${String(stderr || err.message).trim()}`)) : resolve(stdout)),
     );
   });
 }
@@ -75,6 +88,7 @@ export async function collectChanges(repoPath, { mode = 'worktree', base = '' } 
 
   let diffArgs;
   let baseLabel;
+  let oldRev = hasHead ? 'HEAD' : null; // revision holding the "before" side of every file
   let commits = [];
   let includeUntracked = true;
 
@@ -90,6 +104,7 @@ export async function collectChanges(repoPath, { mode = 'worktree', base = '' } 
     }
     const mergeBase = (hasHead && (await tryGit(root, ['merge-base', base, 'HEAD']))) || base;
     diffArgs = [...DIFF_FLAGS, mergeBase];
+    oldRev = mergeBase;
     baseLabel = `${base} (merge-base ${mergeBase.slice(0, 10)}, including uncommitted work)`;
     const log = hasHead ? await tryGit(root, ['log', '--no-merges', '--max-count=200', '--format=%h%x09%an%x09%s', `${mergeBase}..HEAD`]) : '';
     commits = (log || '')
@@ -142,6 +157,12 @@ export async function collectChanges(repoPath, { mode = 'worktree', base = '' } 
   }
 
   files.sort((a, b) => a.path.localeCompare(b.path));
+  await mapLimit(files, 8, async (f) => {
+    f.preview = previewKind(f.path);
+    if (!f.preview) return;
+    f.oldSize = f.status === 'added' || !oldRev ? null : await blobSize(root, `${oldRev}:${f.oldPath || f.path}`);
+    f.newSize = f.status === 'deleted' ? null : mode === 'staged' ? await blobSize(root, `:${f.path}`) : await fileSize(path.join(root, f.path));
+  });
   const stats = {
     files: files.length,
     additions: files.reduce((n, f) => n + f.additions, 0),
@@ -153,6 +174,7 @@ export async function collectChanges(repoPath, { mode = 'worktree', base = '' } 
     repoName: path.basename(root),
     branch,
     mode,
+    oldRev,
     base: mode === 'base' ? base : '',
     baseLabel,
     commits,
@@ -161,4 +183,50 @@ export async function collectChanges(repoPath, { mode = 'worktree', base = '' } 
     stats,
     generatedAt: new Date().toISOString(),
   };
+}
+
+async function blobSize(root, spec) {
+  const out = await tryGit(root, ['cat-file', '-s', spec]);
+  return out === null ? null : Number(out);
+}
+
+async function fileSize(abs) {
+  try {
+    const st = await fs.lstat(abs);
+    return st.isFile() ? st.size : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the raw bytes of one side of a changed file.
+ * side "old": the version in the comparison base (HEAD or the merge-base).
+ * side "new": the working tree (or the index in staged mode).
+ * Returns null when that side does not exist (added or deleted files).
+ */
+export async function readFileVersion(changes, file, side) {
+  const { root } = changes;
+  const tooLarge = () => Object.assign(new Error('File is too large to preview (over 50 MB).'), { status: 413 });
+  if (side === 'old') {
+    if (file.status === 'added' || !changes.oldRev) return null;
+    const spec = `${changes.oldRev}:${file.oldPath || file.path}`;
+    const size = await blobSize(root, spec);
+    if (size === null) return null;
+    if (size > MAX_PREVIEW_BYTES) throw tooLarge();
+    return gitBuffer(root, ['cat-file', 'blob', spec]);
+  }
+  if (file.status === 'deleted') return null;
+  if (changes.mode === 'staged') {
+    const size = await blobSize(root, `:${file.path}`);
+    if (size === null) return null;
+    if (size > MAX_PREVIEW_BYTES) throw tooLarge();
+    return gitBuffer(root, ['cat-file', 'blob', `:${file.path}`]);
+  }
+  const abs = path.resolve(root, file.path);
+  if (!abs.startsWith(root + path.sep)) return null;
+  const size = await fileSize(abs); // lstat: symlinks are never followed out of the repository
+  if (size === null) return null;
+  if (size > MAX_PREVIEW_BYTES) throw tooLarge();
+  return fs.readFile(abs);
 }

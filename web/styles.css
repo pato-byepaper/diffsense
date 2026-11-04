@@ -104,6 +104,38 @@ select:focus, input:focus, textarea:focus { border-color: var(--accent); }
 .file-msg { padding: 14px; color: var(--muted); font-size: 13px; }
 .file-explain { border-top: 1px solid var(--line); padding: 4px 16px 12px; }
 
+/* Before / after comparison */
+.compare-view { padding: 10px 12px 14px; }
+.cmp-summary { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12.5px; margin-bottom: 10px; }
+.cmp-summary a { color: var(--accent); }
+.cmp-summary .mod { color: var(--important); }
+.cmp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.cmp-pane { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
+.cmp-pane.old { border-top: 2px solid var(--del-fg); }
+.cmp-pane.new { border-top: 2px solid var(--add-fg); }
+.cmp-label { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.cmp-label a { margin-left: auto; color: var(--accent); font-size: 12px; }
+.cmp-media { display: flex; align-items: center; justify-content: center; padding: 12px; min-height: 160px; flex: 1; }
+.cmp-media.image, .cmp-media.svg { background-color: #e9ecef; background-image: linear-gradient(45deg, #cfd4da 25%, transparent 25%), linear-gradient(-45deg, #cfd4da 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #cfd4da 75%), linear-gradient(-45deg, transparent 75%, #cfd4da 75%); background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
+.cmp-media img { max-width: 100%; max-height: 70vh; object-fit: contain; }
+.cmp-media.pdf { padding: 0; }
+.cmp-pdf { width: 100%; height: 75vh; border: 0; background: #fff; }
+.cmp-empty { display: flex; align-items: center; justify-content: center; min-height: 160px; flex: 1; color: var(--muted); font-size: 13px; padding: 20px; text-align: center; background: repeating-linear-gradient(45deg, transparent, transparent 8px, rgba(255,255,255,.02) 8px, rgba(255,255,255,.02) 16px); }
+.docx-scroll { border: 1px solid var(--line); border-radius: 6px; overflow: auto; max-height: 80vh; }
+.diff.split { table-layout: fixed; font-family: var(--sans); font-size: 13px; }
+.diff.split th { position: sticky; top: 0; background: var(--panel-2); text-align: left; padding: 6px 10px; font-weight: 600; border-bottom: 1px solid var(--line); z-index: 1; }
+.diff.split col.ln-col { width: 44px; }
+.diff.split td.ln { min-width: 0; }
+.diff.split td.code { padding: 3px 10px; word-break: normal; overflow-wrap: anywhere; }
+.diff.split td.code.del { background: var(--del-bg); }
+.diff.split td.code.add { background: var(--add-bg); }
+.diff.split td.code.empty { background: rgba(255,255,255,.02); }
+.diff.split td.code + td.ln { border-left: 1px solid var(--line); }
+.diff.split mark { color: inherit; border-radius: 2px; padding: 0 1px; }
+.diff.split td.del mark { background: rgba(248, 81, 73, 0.38); }
+.diff.split td.add mark { background: rgba(63, 185, 80, 0.38); }
+.diff.split tr.gap td { text-align: center; padding: 4px; background: rgba(122,162,247,.06); }
+
 /* Severity chip */
 .chip { display: inline-block; font: 600 10.5px var(--mono); text-transform: uppercase; letter-spacing: .4px; padding: 1px 6px; border-radius: 4px; border: 1px solid; }
 .chip.critical { color: var(--critical); border-color: rgba(255,95,86,.5); }
@@ -182,4 +214,5 @@ select:focus, input:focus, textarea:focus { border-color: var(--accent); }
   .layout { grid-template-columns: 1fr; height: auto; }
   .sidebar { max-height: 40vh; }
   .prompts { grid-template-columns: 1fr; }
+  .cmp-grid { grid-template-columns: 1fr; }
 }

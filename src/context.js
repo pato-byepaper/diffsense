@@ -42,7 +42,16 @@ export function findingsList(findings, limit = 300) {
   return lines.join('\n');
 }
 
+const kb = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(2)} MB`);
+function binarySizeNote(file) {
+  if (file.oldSize == null && file.newSize == null) return '';
+  if (file.oldSize == null) return `Added (${kb(file.newSize)}).`;
+  if (file.newSize == null) return `Deleted (was ${kb(file.oldSize)}).`;
+  return `Size ${kb(file.oldSize)} -> ${kb(file.newSize)}.`;
+}
+
 function renderFileBody(file) {
+  if (file.binary && file.preview) return `_${file.preview.toUpperCase()} file, content not shown. ${binarySizeNote(file)}_`;
   if (file.tooLarge) return '_Untracked file larger than 2 MB: content omitted._';
   if (file.binary) return '_Binary file: content not shown._';
   if (file.generated) return `_Generated or lock file: content omitted (+${file.additions} -${file.deletions})._`;
