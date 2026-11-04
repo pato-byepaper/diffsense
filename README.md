@@ -38,6 +38,7 @@
 <p align="center">
   <a href="#the-problem"><b>The Problem</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#what-you-get"><b>Features</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="#see-images-and-documents-change"><b>Images and Docs</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#install-in-60-seconds"><b>Install</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#cli"><b>CLI</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#your-code-stays-yours"><b>Privacy</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
@@ -103,6 +104,61 @@ Point it at any repository. It reads **everything** you changed (committed, stag
   <b>No API key required.</b> Everything works offline with deterministic, local output.<br/>
   Add a Gemini key and every report is written by AI instead, using prompts you can edit.
 </p>
+
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:EF4444,50:8E75B2,100:22C55E&height=3" width="100%" alt="" />
+
+## See images and documents change
+
+A changed logo, a new PDF or an edited contract used to show up as `Binary file.` and nothing else. Now diffsense shows the **previous version on the left** and the **new version on the right**, right next to your code changes.
+
+<p align="center">
+  <img src="https://img.shields.io/badge/PNG-0d1117?style=flat-square" alt="PNG"/>
+  <img src="https://img.shields.io/badge/JPG-0d1117?style=flat-square" alt="JPG"/>
+  <img src="https://img.shields.io/badge/GIF-0d1117?style=flat-square" alt="GIF"/>
+  <img src="https://img.shields.io/badge/WEBP-0d1117?style=flat-square" alt="WebP"/>
+  <img src="https://img.shields.io/badge/AVIF-0d1117?style=flat-square" alt="AVIF"/>
+  <img src="https://img.shields.io/badge/SVG-0d1117?style=flat-square" alt="SVG"/>
+  <img src="https://img.shields.io/badge/PDF-0d1117?style=flat-square" alt="PDF"/>
+  <img src="https://img.shields.io/badge/DOCX-0d1117?style=flat-square" alt="DOCX"/>
+</p>
+
+### Images, SVG and PDF: before and after, side by side
+
+<p align="center">
+  <img src="docs/assets/binary-before-after.svg" alt="A changed PNG that used to show only 'Binary file.' now shows the previous version on the left and the new version on the right, with pixel size and file size" width="100%" />
+</p>
+
+- **Before** (left, red edge) comes from `HEAD`, or from the merge-base when you use `--base`.
+- **After** (right, green edge) is your working tree, or the staged version with `--staged`.
+- Each side shows its pixel size and file size, and the header shows the size change (`225 B -> 269 B (+44 B)`).
+- Transparent images sit on a checkerboard, so you can see their edges.
+- **SVG** has a `Source` button to switch to the line-by-line code diff.
+- **PDF** opens both versions in your browser's built-in PDF viewer.
+- Added or deleted files show an empty side that says so.
+
+### Word documents: see exactly which words changed
+
+<p align="center">
+  <img src="docs/assets/docx-diff.svg" alt="A changed .docx shown as a side-by-side text diff: changed paragraphs tinted red on the left and green on the right, with the exact changed words highlighted" width="100%" />
+</p>
+
+- Every paragraph of the `.docx` is lined up next to its new version.
+- **Red** paragraphs were removed or changed. **Green** paragraphs were added or changed.
+- The exact words that changed are highlighted, so `30 days` -> `15 days` jumps out.
+- Long unchanged stretches fold into `Show N unchanged paragraphs`.
+- `Download before` and `Download after` give you both original files.
+
+<details>
+<summary><b>How it works and what it does not do</b></summary>
+<br/>
+
+- Still **100% local** and **zero dependencies**. The old version is read from git, the new one from your disk, and `.docx` text is read by a small built-in ZIP reader. Nothing is uploaded.
+- The local server only serves files that are part of your current change set. SVGs are served in a way that stops any scripts inside them from running.
+- Files over 50 MB are not previewed.
+- `.docx` comparison is text only. A change that only touches formatting, images or metadata shows `Text is identical`. Headers and footnotes are not included yet.
+- The agent diff lists these files with their type and size change, not their contents.
+
+</details>
 
 <img src="https://capsule-render.vercel.app/api?type=rect&color=0:EF4444,50:8E75B2,100:22C55E&height=3" width="100%" alt="" />
 
@@ -296,7 +352,7 @@ Options
 
 | Tab | What it does |
 |:---|:---|
-| **Changes** | Every changed file with line numbers. Scanner hits marked inline. "Explain entire change" and per-file "Explain file" buttons. |
+| **Changes** | Every changed file with line numbers. Scanner hits marked inline. "Explain entire change" and per-file "Explain file" buttons. Images, SVG and PDF show before and after side by side; `.docx` shows a side-by-side text diff. |
 | **Warnings** | Findings grouped by severity. Click a location to jump to the line. Plus a "Run warning analysis" button. |
 | **Internal Dev Description** | Generates the PR description. Preview with rendered Mermaid diagrams, or edit, copy or download the raw Markdown. |
 | **Client Release** | Generates short release notes. |
@@ -405,6 +461,7 @@ wlu                No-install launcher
 src/cli.js         Argument parsing and commands
 src/git.js         Collects the change set from git
 src/diffParser.js  Unified diff parser
+src/preview.js     Image, SVG, PDF and DOCX previews (DOCX text extraction)
 src/scanner.js     Secret and bad-practice rules, redaction
 src/context.js     Agent-ready Markdown builder
 src/offline.js     Deterministic reports used without an API key
