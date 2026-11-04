@@ -1,13 +1,15 @@
-# diffwise Cloud: PR Gate as a Service
+# diffwise Self-Hosted PR Gate
 
-Design document for running diffwise as a hosted service on AWS, consumed by any team on GitHub through a reusable GitHub Action. The service turns the existing outputs (scanner findings, warning analysis, Internal Dev Description and Client Release notes) into a single, explainable decision on every pull request: **pass**, **warn** or **block**.
+Design document for running diffwise as a PR gate **inside your own AWS account**, deployed with Terraform and used by any team in your GitHub organization through a reusable GitHub Action. It turns the existing outputs (scanner findings, warning analysis, Internal Dev Description and Client Release notes) into a single, explainable decision on every pull request: **pass**, **warn** or **block**.
 
-| Field   | Value                         |
-| ------- | ----------------------------- |
-| Status  | Draft                         |
-| Owner   | pato-byepaper                 |
-| Created | 2026-11-04                    |
-| Version | Targets diffwise 2.0.0        |
+**Nothing goes to ByePaper.** There is no ByePaper service, account, license server or telemetry. You put your AWS credentials in a local `.env`, run Terraform, and the whole stack is created in your AWS account. Your code, your diffs, your findings and your reports stay in your GitHub runners and your AWS account.
+
+| Field   | Value                  |
+| ------- | ---------------------- |
+| Status  | Draft                  |
+| Owner   | pato-byepaper          |
+| Created | 2026-11-04             |
+| Version | Targets diffwise 2.0.0 |
 
 ---
 
@@ -15,77 +17,168 @@ Design document for running diffwise as a hosted service on AWS, consumed by any
 
 ### Goals
 
-- **One line of YAML per repo.** Any team adds `uses: pato-byepaper/diffwise-action@v2` and gets a PR gate, with no infrastructure of their own.
-- **Warnings vs blocks, decided by policy.** Findings are not just listed. A policy engine decides which ones warn (comment, neutral check) and which ones block (failing required check).
-- **Smart gating that understands intent.** The decision considers not only the diff, but also the PR description and the client release notes, and checks that all three agree with each other.
-- **Central policy, local overrides.** An organization sets a baseline; repositories can tighten it, and loosen it only where the org allows.
-- **Auditable.** Every decision, override and policy version is stored, so "why was this PR blocked?" always has an answer.
-- **Keep the privacy guarantees we can keep.** Secrets are redacted inside the GitHub runner, before anything reaches AWS. Source code is never stored at rest by default.
+- **Self-hosted by design.** One `terraform apply` from a laptop or a CI job creates everything in the user's AWS account. ByePaper never receives code, metadata or usage data.
+- **Setup from a `.env`.** AWS credentials and a few settings in `.env`, then a single deploy command. No console clicking.
+- **One line of YAML per repo.** Teams add `uses: pato-byepaper/diffwise-action@v2` with the URL their Terraform printed, and get a PR gate.
+- **Warnings vs blocks, decided by policy.** A policy engine decides which findings warn (comment, neutral check) and which block (failing required check).
+- **Smart gating that understands intent.** The decision looks at the diff, the PR description and the client release notes, and checks that all three agree.
+- **Central policy, per-repo overrides.** The platform team sets a baseline for the whole organization; repositories can tighten it, and loosen it only where the baseline allows.
+- **Auditable.** Every decision, override and policy version is stored in the user's own database.
+- **Clean teardown.** `terraform destroy` removes everything.
 
 ### Non-goals (v2)
 
+- A ByePaper-hosted SaaS. There is none, and the design must not depend on one.
 - Replacing human code review. The gate catches release risk; reviewers still own design and correctness.
-- Supporting GitLab or Bitbucket. The architecture allows it later (the ingest API is provider-neutral), but v2 ships GitHub only.
-- Auto-fixing code. The service suggests fixes; it never pushes commits.
+- GitLab, Bitbucket, Azure or GCP. The structure allows other Terraform providers later, but v2 ships AWS + GitHub only.
+- Auto-fixing code. The gate suggests fixes; it never pushes commits.
 
 ---
 
-## 2. How it works, end to end
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Dev as Developer
-    participant GH as GitHub
-    participant Act as diffwise-action (runner)
-    participant API as API Gateway + Lambda
-    participant Q as SQS
-    participant W as Analysis workers (EC2 ASG)
-    participant LLM as LLM provider
-    participant DB as RDS PostgreSQL
-
-    Dev->>GH: Open / update PR
-    GH->>Act: pull_request event
-    Act->>Act: git diff vs base, run local scanner, redact secrets
-    Act->>GH: Request OIDC token (audience: diffwise)
-    Act->>API: POST /v1/analyses (redacted context + PR body + OIDC JWT)
-    API->>API: Verify JWT, resolve org + repo, load policy
-    API->>DB: Insert analysis (status: queued)
-    API->>Q: Enqueue job
-    API-->>Act: 202 Accepted { analysis_id }
-    Q->>W: Deliver job
-    W->>LLM: Warnings, PR description check, release notes
-    W->>W: Policy engine: pass / warn / block
-    W->>DB: Store findings + decision
-    loop Poll until done (max 10 min)
-        Act->>API: GET /v1/analyses/{id}
-    end
-    API-->>Act: Decision + findings + summary markdown
-    Act->>GH: Check run with annotations, sticky PR comment
-    Act-->>GH: Exit 0 (pass / warn) or 1 (block)
-```
-
-1. The **Action** runs inside the team's own GitHub runner. It reuses the existing diffwise CLI to collect the change set and run the offline scanner. Secrets are replaced with `[REDACTED:rule-id]` here, so raw credentials never leave GitHub.
-2. The Action authenticates with **GitHub OIDC**. No long-lived API key has to be created, rotated or leaked. The service trusts the token's `repository`, `repository_owner` and `ref` claims.
-3. The **API** (Lambda behind API Gateway) validates the request, applies quotas and enqueues the job. It answers in milliseconds, so it never hits the API Gateway 29-second limit.
-4. **Analysis workers** on EC2 run the long LLM tasks in parallel and feed the results into the policy engine.
-5. The Action renders the decision as a **check run** (with inline annotations) and a **sticky PR comment**, then exits non-zero when the decision is `block`. Making the check required in branch protection is what turns "block" into "cannot merge".
-
-### Why the Action does the git work
-
-The runner already has the repository checked out and the permissions to read it. Doing the diff there means the service never needs a GitHub App with `contents: read` on every repository, never clones private code, and only ever receives redacted text. A GitHub App mode (webhooks, no workflow file) is planned for v2.1 for orgs that want zero-config rollout; see section 11.
-
----
-
-## 3. AWS architecture
+## 2. Who talks to whom
 
 ```mermaid
 flowchart LR
-    subgraph GitHub
-        A[diffwise-action]
+    subgraph Laptop["Operator laptop or CI (one time)"]
+        ENV[.env: AWS credentials + settings] --> TF[terraform apply]
     end
 
-    subgraph AWS["AWS (us-east-1, single region in v2)"]
+    subgraph GH["Your GitHub organization"]
+        ACT[diffwise-action in your runners]
+    end
+
+    subgraph AWS["Your AWS account"]
+        STACK[diffwise stack: API Gateway, Lambda, SQS, EC2, RDS, S3]
+    end
+
+    LLM[LLM: Amazon Bedrock in your account, or your own Gemini key, or none]
+
+    TF -->|creates| STACK
+    ACT -->|redacted diff + PR text, OIDC JWT| STACK
+    STACK --> LLM
+    BP[ByePaper]:::none
+
+    classDef none stroke-dasharray: 5 5
+```
+
+ByePaper is drawn only to make the point: no arrow goes to it. The only code ByePaper ships is open source (the CLI, the Action, the Terraform modules), which you pull from GitHub at a version you pin.
+
+The only data that leaves your AWS account is what you choose to send to an LLM:
+
+| LLM option                     | Where the redacted diff goes                                      | Internet egress needed |
+| ------------------------------ | ----------------------------------------------------------------- | ---------------------- |
+| **Amazon Bedrock** (default)   | Bedrock in your own account and region, through a VPC endpoint.   | No                     |
+| **Gemini** (your API key)      | Google Gemini API, directly from your workers.                    | Yes (NAT gateway)      |
+| **Offline**                    | Nowhere. Scanner and deterministic checks only.                    | No                     |
+
+---
+
+## 3. Setup
+
+### 3.1 Prerequisites
+
+- Terraform 1.9+ and Node.js 22+ on the machine that deploys.
+- An AWS account (a dedicated one is recommended) and credentials allowed to create VPC, IAM, Lambda, API Gateway, SQS, EC2, RDS, S3, KMS, Secrets Manager and CloudWatch resources.
+- An S3 bucket for Terraform state (or let the bootstrap step create one).
+- If using Bedrock: model access enabled for the chosen model in the chosen region.
+
+### 3.2 `.env`
+
+The deploy reads a `.env` in the folder where diffwise is cloned. It is already covered by `.gitignore`.
+
+```sh
+# --- AWS credentials (used only on this machine, only by Terraform) ---
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+# AWS_SESSION_TOKEN=          # if using temporary credentials (recommended)
+# AWS_PROFILE=                # alternative to the keys above (SSO / named profile)
+AWS_REGION=us-east-1
+
+# --- Terraform state ---
+DIFFWISE_TF_STATE_BUCKET=acme-diffwise-tfstate
+DIFFWISE_ENVIRONMENT=prod                 # prefix for every resource name
+
+# --- Who may call the gate ---
+DIFFWISE_ALLOWED_GITHUB_ORGS=acme,acme-labs   # OIDC tokens from any other org are rejected
+
+# --- LLM ---
+DIFFWISE_LLM_PROVIDER=bedrock             # bedrock | gemini | offline
+DIFFWISE_BEDROCK_MODEL_ID=                # e.g. an Anthropic Claude model id available in your region
+# GEMINI_API_KEY=                         # only if DIFFWISE_LLM_PROVIDER=gemini
+# GEMINI_MODEL=gemini-3.8-flash
+
+# --- Sizing (optional) ---
+# DIFFWISE_WORKER_INSTANCE_TYPE=c7g.large
+# DIFFWISE_WORKER_MIN=1
+# DIFFWISE_WORKER_MAX=10
+# DIFFWISE_DB_INSTANCE_CLASS=db.t4g.medium
+# DIFFWISE_DB_MULTI_AZ=true
+# DIFFWISE_REPORT_RETENTION_DAYS=30
+```
+
+Credential guidance in the docs:
+
+- Prefer temporary credentials (`AWS_SESSION_TOKEN` or `AWS_PROFILE` with SSO) over long-lived access keys.
+- The credentials are used only by Terraform on the deploy machine. They are never put in GitHub, never stored in Terraform state, and never used by the running stack. The stack runs on IAM roles that Terraform creates.
+- A ready-made least-privilege IAM policy for the deployer is shipped as `infra/terraform/deployer-policy.json`.
+
+### 3.3 Deploy
+
+```sh
+git clone https://github.com/pato-byepaper/diffwise.git
+cd diffwise
+cp .env.example .env          # fill in the values above
+wlu cloud deploy              # loads .env, runs terraform init + plan, asks, then applies
+```
+
+`wlu cloud deploy` is a thin wrapper. It loads `.env`, maps the `DIFFWISE_*` values to `TF_VAR_*`, and runs plain Terraform in `infra/terraform`. Teams that already have a Terraform workflow can skip the wrapper and use the module directly:
+
+```hcl
+module "diffwise" {
+  source = "github.com/pato-byepaper/diffwise//infra/terraform?ref=v2.0.0"
+
+  environment          = "prod"
+  allowed_github_orgs  = ["acme", "acme-labs"]
+  llm_provider         = "bedrock"
+  bedrock_model_id     = var.bedrock_model_id
+  report_retention_days = 30
+}
+
+output "diffwise_api_url" {
+  value = module.diffwise.api_url
+}
+```
+
+When apply finishes it prints:
+
+```text
+diffwise_api_url = "https://abc123.execute-api.us-east-1.amazonaws.com"
+next_step        = "Set the GitHub organization variable DIFFWISE_API_URL to this value."
+```
+
+### 3.4 Connect GitHub
+
+1. In GitHub organization settings, add an **Actions variable** `DIFFWISE_API_URL` with the printed URL. It is a URL, not a secret.
+2. No GitHub secret is needed. The Action authenticates with GitHub OIDC, and the stack only accepts tokens from `DIFFWISE_ALLOWED_GITHUB_ORGS`.
+3. Teams add the workflow in section 6.
+
+### 3.5 Upgrade and teardown
+
+```sh
+git pull && git checkout v2.1.0
+wlu cloud deploy              # terraform apply with the new module version; DB migrations run as part of it
+wlu cloud destroy             # terraform destroy; asks for confirmation, keeps a final RDS snapshot by default
+```
+
+---
+
+## 4. AWS architecture (what Terraform creates)
+
+```mermaid
+flowchart LR
+    A[diffwise-action in GitHub runner] -->|HTTPS + OIDC JWT| WAF
+
+    subgraph AWS["Your AWS account"]
         WAF[AWS WAF] --> APIGW[API Gateway HTTP API]
         APIGW --> L1[Lambda: api]
         L1 --> SQS[(SQS: analyses)]
@@ -93,93 +186,112 @@ flowchart LR
         SQS --> ASG[EC2 Auto Scaling Group: workers]
         L1 --> RDSP[RDS Proxy]
         ASG --> RDSP
-        RDSP --> RDS[(RDS PostgreSQL Multi-AZ)]
-        ASG --> S3[(S3: reports, 30-day lifecycle)]
+        RDSP --> RDS[(RDS PostgreSQL)]
+        ASG --> S3[(S3: reports)]
         L1 --> S3
-        ASG --> SM[Secrets Manager: LLM keys]
-        EB[EventBridge schedules] --> L2[Lambda: maintenance]
+        ASG --> SM[Secrets Manager]
+        ASG -->|VPC endpoint| BR[Amazon Bedrock]
+        EB[EventBridge schedule] --> L2[Lambda: maintenance]
         L2 --> RDSP
         L2 --> S3
         CW[CloudWatch logs, metrics, alarms]
     end
 
-    A -->|HTTPS + OIDC JWT| WAF
-    ASG -->|HTTPS via NAT| LLM[LLM provider API]
+    ASG -.->|only if provider = gemini, via NAT| GEM[Gemini API]
 ```
 
-### Component responsibilities
+### Components
 
-| Component                    | Why this service                                                                                                                                        | Responsibilities                                                                                       |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| **API Gateway (HTTP API)**   | Cheap, managed TLS, throttling, custom domain `api.diffwise.dev`.                                                                                        | Routing, per-route throttling, request size limit (6 MB).                                              |
-| **AWS WAF**                  | Blocks abusive traffic before it costs Lambda time.                                                                                                     | Rate limit per IP, AWS managed rule sets, body size rule.                                              |
-| **Lambda `api`**             | Bursty, short requests. Scales to zero between PR spikes.                                                                                                | OIDC verification, tenant resolution, quota check, enqueue, status polling, policy CRUD, override API. |
-| **SQS + DLQ**                | Decouples ingest from analysis; absorbs Monday-morning PR spikes.                                                                                        | At-least-once delivery, visibility timeout 15 min, 3 retries then DLQ.                                 |
-| **EC2 Auto Scaling Group**   | Analysis can take several minutes for large diffs (beyond comfortable Lambda limits), runs several LLM calls concurrently, and keeps warm connection pools. | Runs the worker process: LLM tasks, cross-checks, policy engine, writes results.                        |
-| **RDS PostgreSQL (Multi-AZ)** | Relational data: tenants, policies with versions, decisions, overrides, audit log. Strong consistency for "is this PR blocked".                            | System of record.                                                                                      |
-| **RDS Proxy**                | Lambda concurrency would otherwise exhaust Postgres connections.                                                                                         | Connection pooling, IAM auth.                                                                           |
-| **S3**                       | Large generated reports do not belong in Postgres rows.                                                                                                  | Full Markdown reports (PR description, release notes, issues). SSE-KMS, 30-day lifecycle.              |
-| **Secrets Manager**          | Central LLM credentials, rotated without redeploys.                                                                                                      | LLM provider keys, DB credentials for migrations.                                                      |
-| **Lambda `maintenance`**     | Scheduled housekeeping.                                                                                                                                 | Purge expired payloads, roll up usage metrics, reset monthly quotas.                                   |
-| **CloudWatch**               | Default AWS observability.                                                                                                                              | Logs (no diff content), metrics, alarms, dashboards.                                                   |
+| Component                     | Why this service                                                                                                         | Responsibilities                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| **API Gateway (HTTP API)**    | Managed TLS, throttling, cheap at PR-level traffic. Optional custom domain via an input variable.                         | Routing, per-route throttling, request size limit.                                                    |
+| **AWS WAF**                   | Rejects abusive traffic before it costs Lambda time.                                                                     | Rate limit per IP, AWS managed rule sets, body size rule. Optional (`enable_waf`).                    |
+| **Lambda `api`**              | Short, bursty requests; scales to zero between PR spikes.                                                                | OIDC verification, allowed-org check, enqueue, status polling, policy and override endpoints.        |
+| **SQS + DLQ**                 | Decouples intake from analysis and absorbs PR spikes.                                                                    | At-least-once delivery, visibility timeout 15 min, 3 attempts then DLQ.                               |
+| **EC2 Auto Scaling Group**    | Large diffs take minutes, several LLM calls run concurrently, warm connection pools.                                     | Worker process: LLM tasks, cross-checks, policy engine, writes results.                               |
+| **RDS PostgreSQL**            | Relational data with strong consistency: policies with versions, decisions, overrides, audit log.                         | System of record. Multi-AZ optional (`db_multi_az`).                                                  |
+| **RDS Proxy**                 | Lambda concurrency would otherwise exhaust Postgres connections.                                                         | Connection pooling, IAM database auth.                                                                |
+| **S3**                        | Full Markdown reports do not belong in table rows.                                                                       | Generated reports. SSE-KMS, lifecycle expiry from `report_retention_days`. Public access blocked.     |
+| **KMS**                       | One customer-managed key for the stack.                                                                                  | Encrypts RDS, S3, SQS, Secrets Manager and CloudWatch logs.                                           |
+| **Secrets Manager**           | Keeps the Gemini key (if used) and DB admin credentials out of code and user data.                                        | Read by workers at start-up through their IAM role.                                                   |
+| **Lambda `maintenance`**      | Scheduled housekeeping.                                                                                                  | Purge expired rows and reports, roll up metrics.                                                      |
+| **CloudWatch**                | Default AWS observability.                                                                                               | Logs (no diff content), metrics, alarms, one dashboard. Alarm emails go to `alarm_email` if set.     |
 
-### EC2 worker details
+### EC2 workers
 
-- **Instance type:** `c7g.large` (Graviton) to start. Workers are I/O bound on LLM calls, so CPU is not the bottleneck.
-- **Scaling:** target tracking on the custom metric `ApproximateNumberOfMessagesVisible / InServiceInstances`, target 4 jobs per instance. Min 1, max 20.
-- **Image:** Amazon Linux 2023 AMI built by EC2 Image Builder, Node.js 22, worker installed as a systemd unit. No SSH; access through SSM Session Manager only.
-- **Networking:** private subnets, outbound through a NAT gateway (LLM provider only), VPC endpoints for SQS, S3, Secrets Manager and CloudWatch.
-- **Graceful shutdown:** lifecycle hook drains in-flight jobs before termination; unfinished messages become visible again through SQS.
+- **Instance:** `c7g.large` (Graviton) by default. Workers are I/O bound on LLM calls.
+- **Image:** latest Amazon Linux 2023 AMI looked up by Terraform. User data installs Node.js and the diffwise release tarball for the exact pinned version from GitHub Releases, verified against its SHA-256 checksum, and runs the worker as a systemd unit.
+- **Scaling:** target tracking on queue depth per instance (default 4 jobs per instance), min and max from `.env`.
+- **Access:** no SSH and no public IP. SSM Session Manager only.
+- **Network:** private subnets. With Bedrock or offline, no NAT gateway is created and the stack has no route to the internet at all; AWS services are reached through VPC endpoints. With Gemini, Terraform adds a NAT gateway.
+- **Graceful shutdown:** lifecycle hook drains in-flight jobs before termination.
 
-> Alternative considered: ECS Fargate for workers. It removes AMI maintenance but costs more per job at steady load. EC2 is the v2 choice; the worker is a plain container-friendly Node process, so moving to Fargate later is a deployment change, not a rewrite.
+> Alternative considered: ECS Fargate for workers. It removes instance management but costs more at steady load. The worker is a plain Node process, so a `worker_runtime = "fargate"` option can be added later without a rewrite.
 
-### Infrastructure as code
+### Terraform layout
 
-All resources are defined in AWS CDK (TypeScript) under `infra/`, with three stacks: `network`, `data` (RDS, S3, KMS) and `app` (API, workers, queues). Environments: `dev`, `staging`, `prod`, each in its own AWS account under AWS Organizations.
+```text
+infra/terraform/
+  main.tf                 Root module wiring
+  variables.tf            All inputs (mapped from .env by wlu cloud deploy)
+  outputs.tf              api_url, dashboard_url, next_step
+  versions.tf             Provider pins, S3 backend
+  deployer-policy.json    Least-privilege IAM policy for whoever runs apply
+  modules/
+    network/              VPC, private subnets, VPC endpoints, optional NAT
+    data/                 KMS, RDS, RDS Proxy, S3 reports bucket
+    queue/                SQS + DLQ
+    api/                  API Gateway, WAF, api Lambda, IAM role
+    workers/              Launch template, ASG, scaling policies, IAM role
+    maintenance/          EventBridge schedule + Lambda
+    observability/        Log groups, alarms, dashboard, SNS topic
+```
+
+Every resource is tagged `app = diffwise` and `environment = <DIFFWISE_ENVIRONMENT>`, and every name is prefixed, so several environments (for example `staging` and `prod`) can live in one account.
 
 ---
 
-## 4. The decision engine
+## 5. The decision engine
 
 This is the "smart" part. Each analysis produces **signals**; the policy engine turns signals into a **decision**.
 
-### 4.1 Signal sources
+### 5.1 Signal sources
 
-| Source                        | Produced by                       | Example signals                                                                                                 |
-| ----------------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| **Local scanner**             | Action (runner), deterministic    | `anthropic-api-key` critical, `ts-ignore` important, `console-log` minor                                        |
-| **Warning analysis**          | Worker, `warnings.md` prompt      | Verdict `Block merge`, confirmed vs false-positive scanner findings, auth or injection warnings W1..Wn          |
-| **PR description check**      | Worker, new `pr-consistency.md`   | Description missing, description contradicts diff, undocumented migration, undocumented new env var            |
-| **Client release check**      | Worker, `client-release.md` + new `release-consistency.md` | User-facing change with no release note, release note claims something the diff does not show |
-| **Metadata**                  | API, from the GitHub event        | Labels, base branch, author association, PR size, touched paths                                                 |
+| Source                    | Produced by                                                 | Example signals                                                                                         |
+| ------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Local scanner**         | Action (runner), deterministic                              | `anthropic-api-key` critical, `ts-ignore` important, `console-log` minor                                |
+| **Warning analysis**      | Worker, `warnings.md` prompt                                | Verdict `Block merge`, confirmed vs false-positive scanner findings, auth or injection warnings W1..Wn  |
+| **PR description check**  | Worker, new `pr-consistency.md`                             | Description missing, contradicts diff, undocumented migration, undocumented new env var                 |
+| **Client release check**  | Worker, `client-release.md` + new `release-consistency.md`  | User-facing change with no release note, release note not backed by the diff                            |
+| **Metadata**              | API, from the GitHub event                                  | Labels, base branch, author association, PR size, touched paths                                         |
 
-### 4.2 Cross-checks between diff, PR description and release notes
+### 5.2 Cross-checks between diff, PR description and release notes
 
-The scanner sees only code. The service also checks that the three stories told about the change agree:
+The scanner sees only code. The gate also checks that the three stories told about the change agree:
 
-| Check ID                         | Compares                                    | Fires when                                                                                                        | Default level |
-| -------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------- |
-| `pr.description-missing`         | PR body                                     | Body empty, or only the unedited template                                                                         | warn          |
-| `pr.description-contradicts`     | PR body vs diff                             | Body says "no schema changes", "no breaking changes", "docs only", but the diff shows otherwise                    | block         |
-| `pr.undocumented-migration`      | Diff vs PR body                             | Migration files or destructive SQL added and not mentioned in the body                                            | block         |
-| `pr.undocumented-env-var`        | Diff vs PR body                             | New environment variable read and not listed in the body                                                          | warn          |
-| `pr.undocumented-dependency`     | Diff vs PR body                             | New or upgraded dependency not mentioned                                                                          | warn          |
-| `release.missing-note`           | Diff vs release section                     | A user-visible change (UI, API response shape, public endpoint) exists, but the PR has no `## Release notes` section | warn          |
-| `release.unsupported-claim`      | Release section vs diff                     | A release note bullet is not backed by any change in the diff                                                     | warn          |
-| `release.leaks-internals`        | Release section                             | Release note names files, functions, tickets or describes a vulnerability                                         | warn          |
-| `release.security-disclosure`    | Release section                             | Release note describes a vulnerability in detail before the fix ships                                             | block         |
-| `risk.scope-mismatch`            | PR title / labels vs diff                   | Title says `fix:` or `docs:` but the diff changes auth, payments or infra paths                                   | warn          |
+| Check ID                        | Compares                   | Fires when                                                                                                         | Default level |
+| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------- |
+| `pr.description-missing`        | PR body                    | Body empty, or only the unedited template                                                                          | warn          |
+| `pr.description-contradicts`    | PR body vs diff            | Body says "no schema changes", "no breaking changes", "docs only", but the diff shows otherwise                     | block         |
+| `pr.undocumented-migration`     | Diff vs PR body            | Migration files or destructive SQL added and not mentioned in the body                                             | block         |
+| `pr.undocumented-env-var`       | Diff vs PR body            | New environment variable read and not listed in the body                                                           | warn          |
+| `pr.undocumented-dependency`    | Diff vs PR body            | New or upgraded dependency not mentioned                                                                           | warn          |
+| `release.missing-note`          | Diff vs release section    | A user-visible change (UI, API response shape, public endpoint) exists, but the PR has no `## Release notes` section | warn          |
+| `release.unsupported-claim`     | Release section vs diff    | A release note bullet is not backed by any change in the diff                                                      | warn          |
+| `release.leaks-internals`       | Release section            | Release note names files, functions or tickets                                                                     | warn          |
+| `release.security-disclosure`   | Release section            | Release note describes a vulnerability in detail before the fix ships                                              | block         |
+| `risk.scope-mismatch`           | PR title / labels vs diff  | Title says `fix:` or `docs:` but the diff changes auth, payments or infra paths                                    | warn          |
 
-The release notes source is the PR body section `## Release notes` (filled in by the author or generated by `wlu release`). If absent, the worker generates release notes itself and attaches them to the comment as a suggestion, so teams get value even before they adopt the convention.
+The release notes source is the PR body section `## Release notes` (written by the author or generated with `wlu release`). If it is missing, the worker generates release notes and attaches them to the comment as a suggestion.
 
-### 4.3 Policy file
+### 5.3 Policy file
 
-Each repository can commit `.github/diffwise.yml`. The org baseline lives in the service and is edited through the API or the org's `.github` repository.
+Each repository can commit `.github/diffwise.yml`. The organization baseline is stored in the stack's database and managed from one repository chosen at deploy time (default: the org's `.github` repository, file `diffwise/baseline.yml`), so changing it is a reviewed PR, not a console edit.
 
 ```yaml
 version: 2
 
-# What decides the outcome. Levels: off | warn | block
+# Levels: off | warn | block
 rules:
   scanner:
     critical: block
@@ -215,59 +327,59 @@ branches:
 
 # How a block can be overridden
 overrides:
-  label: "diffwise:override"          # adding this label re-runs and downgrades block -> warn
-  require-reason: true                # reason must be given in a /diffwise override <reason> comment
-  allowed-teams: ["@acme/security", "@acme/tech-leads"]
-  never-overridable: ["scanner.critical"]   # a live secret can never be waved through
+  label: "diffwise:override"
+  require-reason: true                       # /diffwise override <reason>
+  allowed: codeowners                        # codeowners | teams
+  never-overridable: ["scanner.critical"]    # a live secret can never be waved through
 
 # Paths ignored completely
 ignore:
   - "**/*.snap"
   - "docs/**"
 
-# Escalation: many warnings in one PR become a block
+# Many warnings in one PR become a block
 escalate:
   warn-count-to-block: 8
 ```
 
-### 4.4 Precedence and the decision algorithm
+### 5.4 Precedence and the decision algorithm
 
 1. Start from the **org baseline**.
-2. Apply the **repo file**. A repo may tighten any rule. It may loosen a rule only if the org marked it `repo-overridable: true`. Loosening a locked rule is ignored and reported as a warning in the comment.
-3. Apply **branch** rules, then **path** rules (path rules apply only to findings located in matching files).
+2. Apply the **repo file**. A repo may tighten any rule. It may loosen a rule only if the baseline marks it `repo-overridable: true`. Attempts to loosen a locked rule are ignored and reported in the comment.
+3. Apply **branch** rules, then **path** rules (path rules apply only to findings in matching files).
 4. Map every signal to a level. Signals on `ignore` paths are dropped.
-5. Deduplicate: a scanner finding the LLM marked **False positive** is downgraded one level (block -> warn, warn -> off) and labeled as such. A finding marked **Confirmed** keeps its level.
-6. Escalate: if the number of `warn` signals reaches `warn-count-to-block`, add a synthetic `risk.too-many-warnings` block.
-7. Apply **overrides** (section 4.5).
+5. Deduplicate: a scanner finding the LLM marks **False positive** is downgraded one level (block to warn, warn to off) and labeled as such. **Confirmed** findings keep their level.
+6. Escalate: if `warn` signals reach `warn-count-to-block`, add a synthetic `risk.too-many-warnings` block.
+7. Apply **overrides** (5.5).
 8. Decision = `block` if any block remains, else `warn` if any warn remains, else `pass`.
 
-The worker stores the resolved policy snapshot alongside the decision, so later policy edits never change the explanation of a past decision.
+The resolved policy snapshot is stored with each decision, so later policy edits never change the explanation of a past decision.
 
-### 4.5 Overrides
+### 5.5 Overrides
 
-- A member of `allowed-teams` comments `/diffwise override <reason>` and adds the override label. The Action re-runs, verifies team membership through the GitHub API, and the service downgrades overridable blocks to warn.
-- The override, the actor, the reason and the exact findings it covered are written to the `overrides` and `audit_log` tables.
-- A new push invalidates the override; a fresh analysis runs and must be overridden again if it still blocks.
+- An allowed person (a CODEOWNER of the blocked files by default, or a member of listed teams) comments `/diffwise override <reason>` and adds the override label. The Action re-runs, verifies the person, and the gate downgrades overridable blocks to warn.
+- The override, actor, reason and covered findings are written to `overrides` and `audit_log`.
+- A new push invalidates the override; the new analysis must be overridden again if it still blocks.
 - `never-overridable` rules stay blocking. The only fix is to change the code (and rotate the secret).
 
-### 4.6 LLM failure handling
+### 5.6 Failure handling
 
-The gate must not become flaky because a model is slow or down.
+The gate must not become flaky because a model or the stack is unavailable.
 
-| Situation                                     | Behavior                                                                                                       |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| LLM timeout or error after retries            | LLM-derived signals are skipped. Decision uses scanner + metadata only. Comment says "AI checks unavailable".   |
-| Service unreachable from the Action           | Action falls back to `wlu scan --fail-on critical` locally. Configurable: `on-service-error: fail-open | fail-closed`. |
-| Malformed LLM output                          | Parsed with a strict schema (JSON mode). Unparseable sections are dropped, never guessed.                     |
-| Same PR re-analyzed with no new commits       | Cached decision returned (key: repo + head SHA + base SHA + policy hash).                                     |
+| Situation                                | Behavior                                                                                                             |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| LLM timeout or error after retries       | LLM-derived signals are skipped. Decision uses scanner + metadata. Comment says "AI checks unavailable".             |
+| Stack unreachable from the Action        | Action falls back to `wlu scan --fail-on critical` locally. `on-service-error: fail-open` (default) or `fail-closed`. |
+| Malformed LLM output                     | Parsed with a strict JSON schema. Unparseable sections are dropped, never guessed.                                   |
+| Same PR re-analyzed, no new commits      | Cached decision returned (key: repo + head SHA + base SHA + policy hash).                                            |
 
-Default is `fail-open` for warn-level checks and deterministic scanner blocks always enforced, because those run in the runner and do not depend on AWS.
+Scanner blocks are always enforced, because the scanner runs in the runner and does not depend on AWS.
 
 ---
 
-## 5. The GitHub Action
+## 6. The GitHub Action
 
-Published as `pato-byepaper/diffwise-action`, a composite action that wraps the existing CLI.
+Published as `pato-byepaper/diffwise-action`, a composite action that wraps the existing CLI. It only talks to the URL you give it.
 
 ### Consumer workflow
 
@@ -284,7 +396,7 @@ permissions:
   contents: read
   pull-requests: write   # sticky comment
   checks: write          # check run + annotations
-  id-token: write        # OIDC token for the diffwise service
+  id-token: write        # OIDC token for YOUR diffwise stack
 
 concurrency:
   group: diffwise-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -300,73 +412,107 @@ jobs:
           fetch-depth: 0
       - uses: pato-byepaper/diffwise-action@v2
         with:
-          mode: gate                # gate | report (report never fails the job)
+          api-url: ${{ vars.DIFFWISE_API_URL }}
+          mode: gate                 # gate | report (report never fails the job)
           on-service-error: fail-open
 ```
 
-`edited` is included on purpose: changing the PR description or release notes re-runs the cross-checks without a new push. On `edited` events the worker reuses cached diff analysis and only re-runs the description and release checks.
+`edited` is included on purpose: changing the PR description or release notes re-runs the cross-checks without a new push. On `edited` events the worker reuses the cached diff analysis and only re-runs the description and release checks.
 
-### Action inputs and outputs
+### Request flow
 
-| Input              | Default                     | Description                                                     |
-| ------------------ | --------------------------- | --------------------------------------------------------------- |
-| `mode`             | `gate`                      | `gate` exits 1 on block. `report` only comments.                |
-| `api-url`          | `https://api.diffwise.dev`  | Override for self-hosted deployments.                           |
-| `policy-file`      | `.github/diffwise.yml`      | Repo policy path.                                               |
-| `on-service-error` | `fail-open`                 | `fail-open` or `fail-closed`.                                   |
-| `comment`          | `sticky`                    | `sticky`, `new` or `off`.                                       |
-| `timeout-minutes`  | `10`                        | Max time waiting for the service.                               |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub
+    participant Act as diffwise-action (your runner)
+    participant API as API Gateway + Lambda (your AWS)
+    participant Q as SQS
+    participant W as Workers (EC2)
+    participant LLM as Bedrock / Gemini
+    participant DB as RDS
 
-| Output          | Description                                  |
-| --------------- | -------------------------------------------- |
-| `decision`      | `pass`, `warn` or `block`.                   |
-| `analysis-id`   | Service ID, links to the full report.        |
-| `block-count`   | Number of blocking signals.                  |
-| `warn-count`    | Number of warning signals.                   |
+    GH->>Act: pull_request event
+    Act->>Act: git diff vs base, run scanner, redact secrets
+    Act->>GH: Request OIDC token (audience: diffwise)
+    Act->>API: POST /v1/analyses (redacted context + PR body + JWT)
+    API->>API: Verify JWT, check allowed org, load policy
+    API->>DB: Insert analysis (queued)
+    API->>Q: Enqueue
+    API-->>Act: 202 { analysis_id }
+    Q->>W: Deliver job
+    W->>LLM: Warnings, description check, release check
+    W->>W: Policy engine
+    W->>DB: Findings + decision
+    loop Poll (max 10 min)
+        Act->>API: GET /v1/analyses/{id}
+    end
+    API-->>Act: Decision + findings + comment Markdown
+    Act->>GH: Check run + annotations, sticky comment
+    Act-->>GH: Exit 0 (pass / warn) or 1 (block)
+```
+
+The runner already has the repository checked out, so the stack never needs repository access, never clones code and only receives redacted text.
+
+### Inputs and outputs
+
+| Input              | Default                | Description                                          |
+| ------------------ | ---------------------- | ---------------------------------------------------- |
+| `api-url`          | required               | The `diffwise_api_url` output of your Terraform.     |
+| `mode`             | `gate`                 | `gate` exits 1 on block. `report` only comments.     |
+| `policy-file`      | `.github/diffwise.yml` | Repo policy path.                                    |
+| `on-service-error` | `fail-open`            | `fail-open` or `fail-closed`.                        |
+| `comment`          | `sticky`               | `sticky`, `new` or `off`.                            |
+| `timeout-minutes`  | `10`                   | Max time waiting for the stack.                      |
+
+| Output        | Description                    |
+| ------------- | ------------------------------ |
+| `decision`    | `pass`, `warn` or `block`.     |
+| `analysis-id` | ID in your stack.              |
+| `block-count` | Number of blocking signals.    |
+| `warn-count`  | Number of warning signals.     |
 
 ### What the PR sees
 
-- **Check run** `diffwise / gate`: conclusion `success` (pass), `neutral` (warn) or `failure` (block). Annotations on the exact lines (batched 50 per API call, GitHub's limit).
+- **Check run** `diffwise / gate`: `success` (pass), `neutral` (warn) or `failure` (block), with annotations on the exact lines (batched 50 per API call, GitHub's limit).
 - **Sticky comment**, updated in place:
 
 ```markdown
 ## diffwise: Blocked (2 blocking, 3 warnings)
 
-| Level | Check                        | Where                     | Why                                                        |
-| ----- | ---------------------------- | ------------------------- | ---------------------------------------------------------- |
-| Block | scanner: stripe-live-secret  | `src/pay/client.ts:14`    | Live Stripe key committed. Rotate it, then remove it.      |
-| Block | pr.undocumented-migration    | `db/migrate/0042_drop.sql`| Drops `invoices.legacy_id`; PR body does not mention it.   |
-| Warn  | release.missing-note         | `src/ui/Invoice.tsx`      | Invoice screen changed; add a `## Release notes` section.  |
-| Warn  | pr.undocumented-env-var      | `src/config.ts:31`        | `BILLING_REGION` is new and not listed in the description. |
-| Warn  | scanner: console-log         | `src/pay/client.ts:40`    | Debug logging left in.                                     |
+| Level | Check                       | Where                      | Why                                                        |
+| ----- | --------------------------- | -------------------------- | ---------------------------------------------------------- |
+| Block | scanner: stripe-live-secret | `src/pay/client.ts:14`     | Live Stripe key committed. Rotate it, then remove it.      |
+| Block | pr.undocumented-migration   | `db/migrate/0042_drop.sql` | Drops `invoices.legacy_id`; PR body does not mention it.   |
+| Warn  | release.missing-note        | `src/ui/Invoice.tsx`       | Invoice screen changed; add a `## Release notes` section.  |
+| Warn  | pr.undocumented-env-var     | `src/config.ts:31`         | `BILLING_REGION` is new and not listed in the description. |
+| Warn  | scanner: console-log        | `src/pay/client.ts:40`     | Debug logging left in.                                     |
 
 <details><summary>Suggested release notes</summary>
 
 - Improved invoice totals to show tax separately.
 </details>
 
-Policy `acme/baseline@v7` + repo overrides. Override: `/diffwise override <reason>` (security, tech-leads).
+Policy `baseline@v7` + repo overrides. Override: `/diffwise override <reason>` (CODEOWNERS).
 ```
 
-Making `diffwise / gate` a **required status check** in branch protection or a repository ruleset is what physically prevents merging on `block`. The rollout guide tells teams to do this only after one or two weeks in `report` mode.
+Making `diffwise / gate` a **required status check** (branch protection or a ruleset) is what physically prevents merging on `block`. The rollout guide recommends one or two weeks in `report` mode first.
 
 ---
 
-## 6. API
+## 7. API
 
-Base URL `https://api.diffwise.dev/v1`. All endpoints require either a GitHub OIDC JWT (from Actions) or a GitHub OAuth session (from the dashboard).
+Base URL is your `diffwise_api_url`. Every endpoint requires a GitHub OIDC JWT whose `repository_owner` is in `allowed_github_orgs`.
 
-| Method | Path                              | Purpose                                                       |
-| ------ | --------------------------------- | ------------------------------------------------------------- |
-| POST   | `/analyses`                       | Submit redacted context. Returns `202 { id }`.                |
-| GET    | `/analyses/{id}`                  | Status, decision, signals, comment Markdown.                  |
-| POST   | `/analyses/{id}/overrides`        | Record an override (Action calls it after verifying the team). |
-| GET    | `/orgs/{org}/policy`              | Current baseline policy.                                      |
-| PUT    | `/orgs/{org}/policy`              | Publish a new baseline version (org admins).                  |
-| GET    | `/orgs/{org}/analyses?repo=&decision=` | History for dashboards.                                  |
-| GET    | `/orgs/{org}/usage`               | Analyses and LLM tokens this month.                           |
+| Method | Path                            | Purpose                                              |
+| ------ | ------------------------------- | ---------------------------------------------------- |
+| POST   | `/v1/analyses`                  | Submit redacted context. Returns `202 { id }`.       |
+| GET    | `/v1/analyses/{id}`             | Status, decision, signals, comment Markdown.         |
+| POST   | `/v1/analyses/{id}/overrides`   | Record a verified override.                          |
+| PUT    | `/v1/policy/baseline`           | Publish a new baseline (only from the baseline repo's default branch, checked via the JWT `repository` and `ref` claims). |
+| GET    | `/v1/analyses?repo=&decision=`  | History, for your own dashboards or exports.         |
 
-### `POST /analyses` body
+### `POST /v1/analyses` body
 
 ```json
 {
@@ -386,43 +532,34 @@ Base URL `https://api.diffwise.dev/v1`. All endpoints require either a GitHub OI
 }
 ```
 
-The `diff` field is already redacted by `src/scanner.js` in the runner. The API re-runs the secret rules over it as a second line of defense and rejects the request with `422` if anything unredacted is found.
+The `diff` is redacted by `src/scanner.js` in the runner. The API re-runs the secret rules as a second line of defense and rejects the request with `422` if anything unredacted is found.
 
 ---
 
-## 7. Data model (RDS PostgreSQL)
+## 8. Data model (RDS PostgreSQL)
+
+One installation serves one company, so there is no cross-customer tenancy. `repos` still separates teams inside the organization.
 
 ```mermaid
 erDiagram
-    orgs ||--o{ repos : has
-    orgs ||--o{ policies : versions
     repos ||--o{ analyses : runs
+    policies ||--o{ decisions : applied_in
     analyses ||--o{ signals : produces
     analyses ||--o| decisions : has
     decisions ||--o{ overrides : may_have
-    orgs ||--o{ audit_log : records
 
-    orgs {
-        bigint id PK
-        bigint github_org_id UK
-        text login
-        text plan
-        int monthly_quota
-        timestamptz created_at
-    }
     repos {
         bigint id PK
-        bigint org_id FK
         bigint github_repo_id UK
         text full_name
+        text github_org
         boolean enabled
     }
     policies {
         bigint id PK
-        bigint org_id FK
         int version
         jsonb rules
-        text created_by
+        text source_commit
         timestamptz created_at
     }
     analyses {
@@ -453,6 +590,7 @@ erDiagram
     }
     decisions {
         uuid analysis_id PK
+        bigint policy_id FK
         text outcome
         int block_count
         int warn_count
@@ -468,7 +606,6 @@ erDiagram
     }
     audit_log {
         bigint id PK
-        bigint org_id FK
         text actor
         text action
         jsonb details
@@ -476,104 +613,104 @@ erDiagram
     }
 ```
 
-- Unique index on `analyses (repo_id, head_sha, base_sha, policy_hash)` backs the result cache and makes duplicate SQS deliveries idempotent.
-- `signals.message` stores the finding text, never the code excerpt. The redacted diff lives in the SQS message and, only for the run, in worker memory.
+- Unique index on `analyses (repo_id, head_sha, base_sha, policy_hash)` backs the cache and makes duplicate SQS deliveries idempotent.
+- `signals.message` stores finding text, never code excerpts. The redacted diff exists only in the SQS message and worker memory.
 - `audit_log` is append-only (no `UPDATE` / `DELETE` grants for the app role).
-- Migrations with `node-pg-migrate`, run from a one-off CodeBuild job, never from Lambda cold starts.
+- Migrations run during `terraform apply` through a one-off Lambda invoked by Terraform after the database is ready, never on cold starts.
 
 ---
 
-## 8. Security and privacy
-
-The current README promises "ByePaper never sees your code". The hosted service changes that for teams who opt in, so the promise has to be restated precisely and the local CLI must keep working exactly as today.
+## 9. Security and privacy
 
 | Concern                         | Control                                                                                                                                         |
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| ByePaper access                 | None. No telemetry, no phone-home, no license check. The stack has no configuration value that points to a ByePaper endpoint.                   |
+| Deployer credentials            | Only in the local `.env` (gitignored) and only used by Terraform. Not written to state, not passed to the stack, not needed in GitHub.          |
 | Secrets in diffs                | Redacted in the runner by the existing scanner; re-checked at the API; request rejected if any secret pattern survives.                         |
-| Code at rest                    | Not stored. Diff text exists only in the SQS message (SSE-KMS, 4-day max retention, deleted on success) and worker memory.                      |
-| Reports at rest                 | Generated Markdown in S3, SSE-KMS with a per-environment CMK, 30-day lifecycle, configurable to 0 days (comment only).                        |
-| Authentication                  | GitHub OIDC JWT, verified against GitHub's JWKS. `aud` must equal `diffwise`. `repository_owner_id` must match an enabled org.                   |
-| Tenant isolation                | Every query is scoped by `org_id` resolved from the token, never from the request body. Postgres row-level security as a second guard.          |
-| LLM provider                    | Only redacted text is sent. Provider configured with zero data retention where available. Orgs can choose a provider or disable LLM checks.     |
-| Prompt injection from the diff  | Diff content is wrapped as data in prompts; LLM output is parsed into a strict schema; the LLM can only produce signals, never change policy.    |
-| Fork PRs                        | `pull_request` from forks gets no OIDC token with secrets access; the Action runs in scanner-only local mode. No `pull_request_target`.        |
-| Network                         | Workers and RDS in private subnets. RDS only reachable through RDS Proxy with IAM auth. No public IPs on EC2.                                   |
-| Logging                         | Structured logs contain IDs, counts and timings only. A log filter test fails CI if diff or PR body fields are logged.                          |
-| Compliance path                 | CloudTrail on all accounts, AWS Config rules, GuardDuty. SOC 2 readiness tracked separately.                                                     |
+| Code at rest                    | Not stored. Diff text lives only in the SQS message (SSE-KMS, deleted on success, max 4-day retention) and worker memory.                       |
+| Reports at rest                 | S3 with SSE-KMS, public access blocked, lifecycle expiry from `report_retention_days` (set `0` to keep only the PR comment).                    |
+| Terraform state                 | S3 backend with encryption and versioning. Sensitive inputs (Gemini key) are marked `sensitive`; the docs recommend writing the key to Secrets Manager after apply so it never enters state. |
+| Authentication                  | GitHub OIDC JWT verified against GitHub's JWKS. `aud` must equal `diffwise`; `repository_owner` must be in `allowed_github_orgs`.               |
+| LLM                             | Bedrock keeps traffic in your account through a VPC endpoint. Gemini uses your own key. Offline sends nothing.                                  |
+| Prompt injection from the diff  | Diff content is wrapped as data; LLM output is parsed into a strict schema; the LLM can only produce signals, never change policy.              |
+| Fork PRs                        | Forks get no `id-token: write`, so the Action runs scanner-only locally. Never `pull_request_target`.                                           |
+| Network                         | Workers and RDS in private subnets, no public IPs. With Bedrock or offline, no internet route exists at all.                                    |
+| Logging                         | Logs contain IDs, counts and timings only. A test fails CI if diff or PR body fields are ever logged.                                           |
+| Supply chain                    | Terraform module and worker tarball pinned by version tag and SHA-256 checksum. Provider versions pinned in `versions.tf`.                      |
 
-**Self-hosting:** the CDK app is part of the open-source repo. Teams that cannot send code to a third party deploy the same stack into their own AWS account and set `api-url`.
+The README and `SECURITY.md` keep their current promise unchanged: ByePaper never sees your code, in the local CLI or in the self-hosted gate.
 
 ---
 
-## 9. Operations
+## 10. Operations (in your account)
 
-### SLOs
+### Defaults Terraform sets up
 
-| SLO                                         | Target          |
+- **Alarms:** DLQ depth above 0, oldest message older than 5 minutes, worker error rate above 5%, LLM error rate above 10%, RDS CPU above 70% or free storage below 20%. Sent to an SNS topic, with email if `alarm_email` is set.
+- **Dashboard:** analyses per hour, decisions by outcome, p50/p95 latency, LLM tokens, queue depth.
+- **Backups:** RDS automated backups (7 days default), final snapshot on destroy.
+
+### Target latency
+
+| Metric                                      | Target          |
 | ------------------------------------------- | --------------- |
-| API availability (`POST`, `GET /analyses`)  | 99.9% monthly   |
-| Decision latency, p50 / p95 (diffs < 2k lines) | 45 s / 3 min |
-| Scanner-only decision when LLM is down      | < 20 s          |
+| Decision p50 / p95 (diffs under 2k lines)   | 45 s / 3 min    |
+| Scanner-only decision when the LLM is down  | under 20 s      |
 
-### Alarms
+### Rough AWS cost (your bill, ~20k analyses/month)
 
-- DLQ depth > 0 for 5 minutes.
-- Queue age of oldest message > 5 minutes.
-- Worker error rate > 5% over 10 minutes.
-- LLM error rate > 10% over 10 minutes (switches the comment banner to "AI checks degraded").
-- RDS CPU > 70% or free storage < 20%.
+| Item                                         | Monthly (USD, rough) |
+| -------------------------------------------- | -------------------- |
+| EC2 workers (avg 2 x c7g.large)              | 105                  |
+| RDS PostgreSQL db.t4g.medium (Multi-AZ)      | 140                  |
+| RDS Proxy                                    | 25                   |
+| VPC interface endpoints                      | 50                   |
+| Lambda + API Gateway + SQS                   | 10                   |
+| S3, KMS, Secrets Manager, CloudWatch         | 25                   |
+| **Infrastructure total**                     | **~355**             |
+| NAT gateway (Gemini only)                    | +35                  |
+| LLM usage                                    | Depends on model and diff size; tracked in `analyses.llm_tokens` |
 
-### Cost estimate (prod, 50 orgs, ~20k analyses/month)
-
-| Item                                  | Monthly (USD, rough) |
-| ------------------------------------- | -------------------- |
-| EC2 workers (avg 3 x c7g.large)       | 160                  |
-| RDS PostgreSQL db.t4g.medium Multi-AZ | 140                  |
-| RDS Proxy                             | 25                   |
-| NAT gateway + data                    | 45                   |
-| Lambda + API Gateway + SQS            | 15                   |
-| S3, KMS, Secrets Manager, CloudWatch  | 30                   |
-| **Infrastructure total**              | **~415**             |
-| LLM tokens (dominant, ~4 calls/analysis) | Depends on model and diff size; tracked per org in `analyses.llm_tokens` |
-
-Per-org monthly quotas protect against runaway LLM spend. Above quota, analyses run in scanner-only mode and the comment says so.
+A `small` sizing preset (single-AZ RDS `db.t4g.micro`, 1 worker, no WAF) is offered for small teams and evaluation, around 80 USD/month before LLM usage.
 
 ---
 
-## 10. Changes to this repository
+## 11. Changes to this repository
 
-| Area                         | Change                                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `src/cli.js`                 | New `wlu ci` command: collect, scan, redact, emit the `POST /analyses` payload as JSON.                        |
-| `src/llm/`                   | Extract `src/gemini.js` behind a provider interface so workers can use other providers (e.g. Claude via Amazon Bedrock). |
-| `src/policy.js`              | New. Pure policy resolution + decision function, shared by worker and CLI (`wlu gate --policy` works offline). |
-| `prompts/`                   | New `pr-consistency.md` and `release-consistency.md`. `warnings.md` gets a JSON output variant.               |
-| `service/`                   | New. `api` Lambda handler and `worker` process.                                                               |
-| `infra/`                     | New. AWS CDK stacks.                                                                                          |
-| `action/`                    | New. Composite action, published to `pato-byepaper/diffwise-action` by a release workflow.                     |
-| `README.md`, `SECURITY.md`   | Separate "Local CLI" and "diffwise Cloud" privacy sections.                                                   |
-| `test/`                      | Policy engine table tests, payload schema tests, redaction re-check tests.                                    |
+| Area                        | Change                                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `src/cli.js`                | `wlu ci` (collect, scan, redact, emit the payload), `wlu cloud deploy`, `wlu cloud destroy`.                    |
+| `src/llm/`                  | Move `src/gemini.js` behind a provider interface; add a Bedrock provider.                                       |
+| `src/policy.js`             | New. Pure policy resolution + decision function, shared by worker and CLI (`wlu gate` works fully offline).     |
+| `prompts/`                  | New `pr-consistency.md` and `release-consistency.md`; JSON output variant of `warnings.md`.                    |
+| `service/`                  | New. `api` Lambda handler, `worker` process, `maintenance` Lambda, DB migrations.                               |
+| `infra/terraform/`          | New. Root module, submodules, `deployer-policy.json`.                                                           |
+| `action/`                   | New. Composite action, published to `pato-byepaper/diffwise-action` by a release workflow.                       |
+| `.env.example`              | New AWS, Terraform and `DIFFWISE_*` entries (section 3.2).                                                      |
+| `.gitignore`                | Add `.terraform/`, `*.tfstate*`, `*.tfvars` (except examples).                                                  |
+| `README.md`, `SECURITY.md`  | Self-hosting guide and threat model; privacy promise unchanged.                                                 |
+| `test/`                     | Policy engine table tests, payload schema tests, redaction re-check tests, `terraform validate` + `tflint` in CI. |
 
-Keeping `src/policy.js` pure and shared means the same `.github/diffwise.yml` gives the same decision locally, in self-hosted deployments and in the cloud.
-
----
-
-## 11. Rollout plan
-
-| Phase | Scope                                                                                                     | Exit criteria                                                         |
-| ----- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| 0     | `wlu ci` + `src/policy.js` locally; Action in scanner-only mode (no AWS).                                 | Teams can block on scanner findings with the policy file today.       |
-| 1     | AWS stack in `dev`/`staging`; warning analysis only; `report` mode for 2 pilot teams.                     | p95 latency met; false-positive rate on blocks < 5% over 2 weeks.     |
-| 2     | PR description and release cross-checks; overrides; sticky comment; `gate` mode for pilots.              | Pilot teams make the check required; no unexplained blocks reported. |
-| 3     | General availability: org baseline policies, dashboard, quotas, self-hosting guide.                       | 10 orgs onboarded.                                                    |
-| 4 (v2.1) | GitHub App mode (webhooks to API Gateway, no workflow file), merge queue support (`merge_group` event). | Zero-config org installs.                                             |
+Because `src/policy.js` is pure and shared, the same `.github/diffwise.yml` produces the same decision on a laptop, in the runner and in the AWS stack.
 
 ---
 
-## 12. Open questions
+## 12. Rollout plan
 
-1. **LLM provider default:** stay on Gemini, or default to Claude through Amazon Bedrock so traffic stays inside AWS and under the same data-processing agreement?
-2. **Release notes source of truth:** PR body section, a `CHANGELOG.md` entry, or a changeset file (`.changeset/*.md`)? The cross-check can support all three; the default needs a decision.
-3. **Override authority:** GitHub team membership (needs `read:org`, which the default `GITHUB_TOKEN` cannot do) or CODEOWNERS approval of the PR? CODEOWNERS works with default permissions.
-4. **Pricing:** free tier size and whether scanner-only mode stays free forever.
-5. **Multi-region:** is single-region `us-east-1` acceptable for EU customers, or is `eu-west-1` needed at GA?
+| Phase    | Scope                                                                                              | Exit criteria                                                        |
+| -------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 0        | `wlu ci` + `src/policy.js`; Action in scanner-only mode (no AWS needed).                           | Teams can block on scanner findings with the policy file.            |
+| 1        | Terraform stack, warning analysis, `report` mode. Deployed to a test account and torn down cleanly. | `apply` and `destroy` succeed from an empty account; p95 target met. |
+| 2        | Description and release cross-checks, overrides, sticky comment, `gate` mode.                      | Pilot teams make the check required; block false-positive rate under 5%. |
+| 3        | v2.0.0 release: docs, sizing presets, upgrade path tested from 2.0 to 2.1.                          | A new user goes from clone to first gated PR in under 30 minutes.    |
+| 4 (v2.1) | Optional GitHub App mode (webhooks into the same stack), merge queue support (`merge_group`).       | Org-wide rollout without per-repo workflow files.                    |
+
+---
+
+## 13. Open questions
+
+1. **Default LLM:** Bedrock as the default (no egress, stays in the account) and Gemini as opt-in, or the other way around to match the current CLI?
+2. **Release notes source of truth:** PR body section, a `CHANGELOG.md` entry, or a changeset file (`.changeset/*.md`)?
+3. **Override authority:** CODEOWNERS (works with the default `GITHUB_TOKEN`) or GitHub teams (needs `read:org`, so a GitHub App or extra token)?
+4. **Baseline policy home:** org `.github` repository, or a dedicated `diffwise-policy` repository?
+5. **Other clouds:** is there demand for GCP or Azure Terraform modules after v2?
