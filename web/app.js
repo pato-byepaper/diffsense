@@ -27,6 +27,8 @@ const state = {
   prompts: null,
   activePrompt: 'issues',
   promptDraft: {},
+  sourceView: new Set(), // SVG files shown as source instead of visual comparison
+  docText: new Map(), // cached .docx text per URL
 };
 
 /* ---------- helpers ---------- */
@@ -354,6 +356,7 @@ function fileCard(f, findings) {
     f.untracked ? h('span', { class: 'chip info' }, 'untracked') : null,
     h('span', { class: 'nums' }, h('span', { class: 'add' }, `+${f.additions}`), ' ', h('span', { class: 'del' }, `-${f.deletions}`)),
     f.hunks.length ? h('button', { class: 'btn small', onclick: () => (state.collapsed.delete(f.path), state.expanded.add(f.path), generate('explain-file', f.path)) }, 'Explain file') : null,
+    f.preview === 'svg' && f.hunks.length ? h('button', { class: 'btn small', onclick: () => (state.sourceView.has(f.path) ? state.sourceView.delete(f.path) : state.sourceView.add(f.path), render()) }, state.sourceView.has(f.path) ? 'Visual' : 'Source') : null,
     h('button', { class: 'btn small', onclick: toggle }, collapsed ? 'Show' : 'Hide'),
   );
   const card = h('div', { class: `file-card${collapsed ? ' collapsed' : ''}`, dataset: { path: f.path } }, head);
@@ -362,7 +365,8 @@ function fileCard(f, findings) {
   const key = outputKey('explain-file', f.path);
   if (state.outputs[key] || state.busy[key]) card.append(h('div', { class: 'file-explain' }, outputPanel('explain-file', f.path)));
 
-  if (f.tooLarge) card.append(h('div', { class: 'file-msg' }, 'Untracked file larger than 2 MB. Content not shown.'));
+  if (f.preview && !(f.preview === 'svg' && state.sourceView.has(f.path) && f.hunks.length)) card.append(compareView(f));
+  else if (f.tooLarge) card.append(h('div', { class: 'file-msg' }, 'Untracked file larger than 2 MB. Content not shown.'));
   else if (f.binary) card.append(h('div', { class: 'file-msg' }, 'Binary file.'));
   else if (!f.hunks.length) card.append(h('div', { class: 'file-msg' }, f.modeChange ? `Mode changed ${f.modeChange}.` : 'No content changes.'));
   else card.append(diffTable(f, findings));
@@ -405,6 +409,196 @@ function diffTable(f, findings) {
     }
   }
   return h('table', { class: 'diff' }, tbody);
+}
+
+/* ---------- before / after comparison (images, SVG, PDF, DOCX) ---------- */
+
+function formatBytes(n) {
+  if (n === null || n === undefined) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function fileUrl(f, side, format = null) {
+  const p = compareQuery();
+  p.set('path', f.path);
+  p.set('side', side);
+  if (format) p.set('format', format);
+  p.set('v', state.data.meta.generatedAt); // new URL after every refresh, so cached previews never go stale
+  return `/api/file?${p}`;
+}
+
+function sideLabels() {
+  const { mode, base } = state.data.meta;
+  return { old: mode === 'base' ? `Before (${base})` : 'Before (HEAD)', new: mode === 'staged' ? 'After (staged)' : 'After (working tree)' };
+}
+
+function sizeSummary(f) {
+  if (f.oldSize == null && f.newSize == null) return null;
+  if (f.oldSize == null) return `Added, ${formatBytes(f.newSize)}`;
+  if (f.newSize == null) return `Deleted, was ${formatBytes(f.oldSize)}`;
+  const d = f.newSize - f.oldSize;
+  return `${formatBytes(f.oldSize)} -> ${formatBytes(f.newSize)} (${d === 0 ? 'same size' : `${d > 0 ? '+' : '-'}${formatBytes(Math.abs(d))}`})`;
+}
+
+function compareView(f) {
+  const exists = { old: f.status !== 'added' && f.oldSize != null, new: f.status !== 'deleted' && f.newSize != null };
+  const labels = sideLabels();
+  const summary = h('div', { class: 'cmp-summary' }, h('span', { class: 'chip info' }, f.preview), h('span', { class: 'muted' }, sizeSummary(f) || ''));
+  if (f.preview === 'docx') return h('div', { class: 'compare-view' }, summary, docxCompare(f, exists, labels));
+
+  const pane = (side) => {
+    const meta = h('span', { class: 'muted' }, exists[side] ? formatBytes(side === 'old' ? f.oldSize : f.newSize) : '');
+    const head = h('div', { class: 'cmp-label' }, h('strong', {}, labels[side]), meta, exists[side] ? h('a', { href: fileUrl(f, side), target: '_blank', rel: 'noopener' }, 'Open') : null);
+    if (!exists[side]) return h('div', { class: `cmp-pane ${side}` }, head, h('div', { class: 'cmp-empty' }, side === 'old' ? 'File did not exist before this change.' : 'File was deleted in this change.'));
+    let media;
+    if (f.preview === 'pdf') {
+      media = h('iframe', { class: 'cmp-pdf', src: fileUrl(f, side), title: `${labels[side]}: ${f.path}`, loading: 'lazy' });
+    } else {
+      media = h('img', {
+        src: fileUrl(f, side),
+        alt: `${labels[side]}: ${f.path}`,
+        loading: 'lazy',
+        onload: (e) => (meta.textContent = `${e.target.naturalWidth} x ${e.target.naturalHeight} px, ${meta.textContent}`),
+        onerror: (e) => e.target.replaceWith(h('div', { class: 'cmp-empty' }, 'This image could not be displayed by the browser.')),
+      });
+    }
+    return h('div', { class: `cmp-pane ${side}` }, head, h('div', { class: `cmp-media ${f.preview}` }, media));
+  };
+  return h('div', { class: 'compare-view' }, summary, h('div', { class: 'cmp-grid' }, pane('old'), pane('new')));
+}
+
+async function fetchText(url) {
+  if (!state.docText.has(url)) {
+    state.docText.set(
+      url,
+      fetch(url).then(async (res) => {
+        const body = await res.text();
+        if (!res.ok) throw new Error(res.headers.get('content-type')?.includes('json') ? JSON.parse(body).error : body);
+        return body;
+      }),
+    );
+  }
+  return state.docText.get(url);
+}
+
+function docxCompare(f, exists, labels) {
+  const box = h('div', { class: 'docx-cmp' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), 'Reading document text...'));
+  const load = (side) => (exists[side] ? fetchText(fileUrl(f, side, 'text')) : Promise.resolve(''));
+  Promise.all([load('old'), load('new')])
+    .then(([a, b]) => box.replaceChildren(docxTable(f, a, b, exists, labels)))
+    .catch((err) => {
+      state.docText.clear();
+      box.replaceChildren(h('div', { class: 'error' }, err.message));
+    });
+  return box;
+}
+
+/** Longest-common-subsequence diff of two arrays. Returns [{type: 'same'|'del'|'add', a?, b?}]. */
+function diffSeq(a, b, limit = 4_000_000) {
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const A = a.slice(pre, a.length - suf);
+  const B = b.slice(pre, b.length - suf);
+  const ops = a.slice(0, pre).map((x) => ({ type: 'same', a: x, b: x }));
+  if (A.length * B.length > limit) {
+    ops.push(...A.map((x) => ({ type: 'del', a: x })), ...B.map((x) => ({ type: 'add', b: x })));
+  } else {
+    const n = A.length;
+    const m = B.length;
+    const dp = new Uint32Array((n + 1) * (m + 1));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i * (m + 1) + j] = A[i] === B[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
+    let i = 0;
+    let j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && A[i] === B[j]) ops.push({ type: 'same', a: A[i++], b: B[j++] });
+      else if (j < m && (i === n || dp[i * (m + 1) + j + 1] >= dp[(i + 1) * (m + 1) + j])) ops.push({ type: 'add', b: B[j++] });
+      else ops.push({ type: 'del', a: A[i++] });
+    }
+  }
+  ops.push(...a.slice(a.length - suf).map((x) => ({ type: 'same', a: x, b: x })));
+  return ops;
+}
+
+/** Highlights changed words between two paragraphs. */
+function wordDiff(a, b, side) {
+  const wa = a.split(/(\s+)/);
+  const wb = b.split(/(\s+)/);
+  if (wa.length * wb.length > 250_000) return [side === 'old' ? a : b];
+  return diffSeq(wa, wb)
+    .filter((op) => op.type === 'same' || op.type === (side === 'old' ? 'del' : 'add'))
+    .map((op) => (op.type === 'same' ? op.a : h('mark', {}, side === 'old' ? op.a : op.b)));
+}
+
+function docxTable(f, oldText, newText, exists, labels) {
+  const split = (t) => (t ? t.replace(/\n$/, '').split('\n') : []);
+  const ops = diffSeq(split(oldText), split(newText));
+
+  // Pair runs of deletions and additions into side-by-side rows.
+  const rows = [];
+  let oldNo = 0;
+  let newNo = 0;
+  for (let k = 0; k < ops.length; ) {
+    if (ops[k].type === 'same') {
+      rows.push({ type: 'same', oldNo: ++oldNo, newNo: ++newNo, a: ops[k].a, b: ops[k].b });
+      k++;
+      continue;
+    }
+    const dels = [];
+    const adds = [];
+    while (k < ops.length && ops[k].type !== 'same') (ops[k].type === 'del' ? dels : adds).push(ops[k++]);
+    for (let r = 0; r < Math.max(dels.length, adds.length); r++) {
+      const d = dels[r];
+      const a = adds[r];
+      rows.push({ type: d && a ? 'change' : d ? 'del' : 'add', oldNo: d ? ++oldNo : null, newNo: a ? ++newNo : null, a: d?.a, b: a?.b });
+    }
+  }
+
+  const counts = { add: 0, del: 0, change: 0 };
+  for (const r of rows) if (r.type !== 'same') counts[r.type]++;
+  const stats = h(
+    'div',
+    { class: 'cmp-summary' },
+    h('span', { class: 'add' }, `${counts.add} paragraph${counts.add === 1 ? '' : 's'} added`),
+    h('span', { class: 'del' }, `${counts.del} removed`),
+    h('span', { class: 'mod' }, `${counts.change} changed`),
+    h('a', { href: exists.old ? fileUrl(f, 'old') : null, hidden: !exists.old }, 'Download before'),
+    h('a', { href: exists.new ? fileUrl(f, 'new') : null, hidden: !exists.new }, 'Download after'),
+  );
+  if (!rows.length) return h('div', {}, stats, h('div', { class: 'file-msg' }, 'The document has no text.'));
+  if (!counts.add && !counts.del && !counts.change) stats.append(h('span', { class: 'muted' }, 'Text is identical; only formatting, images or metadata changed.'));
+
+  // Show changed paragraphs with 2 lines of context; collapse long unchanged stretches.
+  const CONTEXT = 2;
+  const near = rows.map(() => false);
+  rows.forEach((r, i) => {
+    if (r.type === 'same') return;
+    for (let k = Math.max(0, i - CONTEXT); k <= Math.min(rows.length - 1, i + CONTEXT); k++) near[k] = true;
+  });
+  const tbody = h('tbody');
+  const cell = (r, side) => {
+    const text = side === 'old' ? r.a : r.b;
+    if (text === undefined) return h('td', { class: 'code empty' });
+    const content = r.type === 'change' ? wordDiff(r.a, r.b, side) : [text];
+    return h('td', { class: `code ${r.type === 'same' ? '' : side === 'old' ? 'del' : 'add'}` }, ...content);
+  };
+  const addRow = (r) => tbody.append(h('tr', { class: `row-${r.type}` }, h('td', { class: 'ln' }, r.oldNo ?? ''), cell(r, 'old'), h('td', { class: 'ln' }, r.newNo ?? ''), cell(r, 'new')));
+  for (let i = 0; i < rows.length; ) {
+    if (near[i] || counts.add + counts.del + counts.change === 0) {
+      addRow(rows[i++]);
+      continue;
+    }
+    const start = i;
+    while (i < rows.length && !near[i]) i++;
+    const hidden = rows.slice(start, i);
+    const gap = h('tr', { class: 'gap' }, h('td', { colspan: 4 }, h('button', { class: 'btn small', onclick: () => gap.replaceWith(...hidden.map((r) => h('tr', { class: 'row-same' }, h('td', { class: 'ln' }, r.oldNo), cell(r, 'old'), h('td', { class: 'ln' }, r.newNo), cell(r, 'new')))) }, `Show ${hidden.length} unchanged paragraph${hidden.length === 1 ? '' : 's'}`)));
+    tbody.append(gap);
+  }
+  const head = h('thead', {}, h('tr', {}, h('th', { colspan: 2 }, labels.old), h('th', { colspan: 2 }, labels.new)));
+  return h('div', {}, stats, h('div', { class: 'docx-scroll' }, h('table', { class: 'diff split' }, h('colgroup', {}, h('col', { class: 'ln-col' }), h('col'), h('col', { class: 'ln-col' }), h('col')), head, tbody)));
 }
 
 /* ---------- warnings tab ---------- */

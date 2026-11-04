@@ -5,7 +5,8 @@ import path from 'node:path';
 import { TOOL_ROOT } from './config.js';
 import { buildAgentDocument } from './context.js';
 import { runTask, TASKS } from './generate.js';
-import { collectChanges, listRefs, resolveRepo } from './git.js';
+import { collectChanges, listRefs, readFileVersion, resolveRepo } from './git.js';
+import { contentTypeFor, docxToText } from './preview.js';
 import { listPrompts, PLACEHOLDERS, resetPrompt, savePrompt } from './prompts.js';
 import { scanChanges } from './scanner.js';
 import { c } from './util.js';
@@ -70,9 +71,52 @@ export async function startServer({ repoPath, config, open = true, initial = { m
   // and only accept state-changing requests from our own origin (blocks CSRF from other sites).
   const allowedHosts = () => new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
 
+  // The last change set is reused for a few seconds so the many preview requests a page
+  // makes right after loading do not each re-run git diff.
+  let cached = null;
   async function load(opts) {
     const changes = await collectChanges(root, opts);
+    cached = { key: JSON.stringify(opts), at: Date.now(), changes };
     return { changes, findings: scanChanges(changes.files) };
+  }
+  async function changesFor(opts) {
+    if (cached && cached.key === JSON.stringify(opts) && Date.now() - cached.at < 10_000) return cached.changes;
+    return (await load(opts)).changes;
+  }
+
+  async function sendFileVersion(res, url) {
+    const opts = changeOptsFrom(Object.fromEntries(url.searchParams));
+    const side = url.searchParams.get('side') === 'old' ? 'old' : 'new';
+    const format = url.searchParams.get('format') || 'raw';
+    const changes = await changesFor(opts);
+    // Only files that are part of the change set can be read, which rules out path traversal.
+    const file = changes.files.find((f) => f.path === url.searchParams.get('path'));
+    if (!file || !file.preview) return sendJson(res, 404, { error: 'Not a previewable changed file.' });
+    const buf = await readFileVersion(changes, file, side);
+    if (!buf) return sendJson(res, 404, { error: `No ${side === 'old' ? 'previous' : 'new'} version of this file.` });
+
+    if (format === 'text') {
+      if (file.preview !== 'docx') return sendJson(res, 400, { error: 'Text extraction is only available for .docx files.' });
+      let text;
+      try {
+        text = docxToText(buf);
+      } catch (err) {
+        return sendJson(res, 422, { error: `Could not read the document: ${err.message}` });
+      }
+      return send(res, 200, text, 'text/plain; charset=utf-8', { 'Cache-Control': 'private, max-age=300' });
+    }
+
+    const name = path.basename(side === 'old' ? file.oldPath || file.path : file.path).replace(/[^\w.-]/g, '_');
+    // SVG can carry scripts: the sandbox CSP keeps it inert even if opened directly.
+    // PDFs are framed by the UI, so they only get frame-ancestors.
+    const csp = file.preview === 'pdf' ? "frame-ancestors 'self'" : "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox";
+    return send(res, 200, buf, contentTypeFor(file.path), {
+      'Content-Security-Policy': csp,
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'X-Frame-Options': 'SAMEORIGIN',
+      'Cache-Control': 'private, max-age=300',
+      'Content-Disposition': `${file.preview === 'docx' ? 'attachment' : 'inline'}; filename="${side}-${name}"`,
+    });
   }
 
   async function handle(req, res) {
@@ -112,6 +156,8 @@ export async function startServer({ repoPath, config, open = true, initial = { m
         findings,
       });
     }
+
+    if (req.method === 'GET' && route === '/api/file') return sendFileVersion(res, url);
 
     if (req.method === 'GET' && route === '/api/refs') {
       return sendJson(res, 200, { refs: await listRefs(root) });

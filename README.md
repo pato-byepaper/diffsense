@@ -179,6 +179,7 @@ If you did not run `npm link`, use the full path to the launcher instead, for ex
 | Tab                      | What it does                                                                                                                       |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Changes                  | Every changed file with line numbers. Scanner hits are marked inline. "Explain entire change" and per-file "Explain file" buttons. |
+| Changes: binary files    | Images (PNG, JPG, GIF, WebP, AVIF, BMP, ICO), SVG and PDF show **Before** on the left and **After** on the right, with sizes and image dimensions. Word `.docx` files show a side-by-side text diff with changed words highlighted. SVG can toggle to its source diff. |
 | Warnings                 | Scanner findings grouped by severity (click a location to jump to the line), plus a "Run warning analysis" button.                 |
 | Internal Dev Description | Generates the PR description. Preview with rendered Mermaid diagrams, or switch to raw Markdown, edit, copy or download.           |
 | Client Release           | Generates short release notes.                                                                                                     |
