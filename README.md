@@ -19,6 +19,7 @@
   <img src="https://img.shields.io/badge/git-0d1117?style=flat-square&logo=git&logoColor=F05032" alt="git"/>
   <img src="https://img.shields.io/badge/CLI_+_Web_UI-0d1117?style=flat-square&logo=gnubash&logoColor=white" alt="CLI and Web UI"/>
   <img src="https://img.shields.io/badge/Works_with_any_agent-0d1117?style=flat-square&logo=probot&logoColor=22C55E" alt="Any agent"/>
+  <img src="https://img.shields.io/badge/Self--host_on_AWS-0d1117?style=flat-square&logo=amazonwebservices&logoColor=FF9900" alt="Self-host on AWS"/>
 </p>
 
 <br/>
@@ -41,6 +42,7 @@
   <a href="#see-images-and-documents-change"><b>Images and Docs</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#install-in-60-seconds"><b>Install</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#cli"><b>CLI</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
+  <a href="#self-host-the-pr-gate-on-aws"><b>AWS</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#your-code-stays-yours"><b>Privacy</b></a> &nbsp;&nbsp;|&nbsp;&nbsp;
   <a href="#scanner-rules"><b>Scanner</b></a>
 </p>
@@ -318,6 +320,65 @@ Fails the build if a critical finding shows up in the PR.
 
 <img src="https://capsule-render.vercel.app/api?type=rect&color=0:EF4444,50:8E75B2,100:22C55E&height=3" width="100%" alt="" />
 
+## Self-host the PR gate on AWS
+
+<p align="center">
+  <img src="https://readme-typing-svg.demolab.com?font=JetBrains+Mono&weight=800&size=26&duration=2800&pause=1400&color=FF9900&center=true&vCenter=true&width=860&height=55&lines=Your+AWS+account.+Your+rules.;small%3A+a+few+dollars+a+month+for+startups.;full%3A+private%2C+multi-AZ%2C+built+for+scale.;One+.env.+One+command.+Zero+ByePaper+servers." alt="Your AWS account. Your rules." />
+</p>
+
+Want every pull request across your GitHub organization checked before it merges, with a clear **pass**, **warn** or **block**? Deploy the diffwise gate **into your own AWS account** with Terraform. ByePaper runs no server here either: your diffs stay in your GitHub runners and your AWS account.
+
+<p align="center">
+  <img src="docs/assets/aws-deployments.svg" alt="Side by side: the small deployment sends a PR through API Gateway, a queue and Lambda workers into an Aurora database that pauses when idle, for about 2 to 10 USD a month. The full deployment adds WAF, EC2 workers that scale out and a multi-AZ database, for about 330 USD a month." width="100%" />
+</p>
+
+### Pick your size
+
+<table>
+  <tr>
+    <th width="20%"></th>
+    <th width="40%"><img src="https://img.shields.io/badge/SMALL-%242--10_%2F_month-22C55E?style=for-the-badge&labelColor=0d1117" alt="small: 2 to 10 USD a month"/></th>
+    <th width="40%"><img src="https://img.shields.io/badge/FULL-~%24330_%2F_month-8E75B2?style=for-the-badge&labelColor=0d1117" alt="full: about 330 USD a month"/></th>
+  </tr>
+  <tr><td><b>Made for</b></td><td>Startups and small teams on a tight budget</td><td>Larger orgs, steady load, compliance</td></tr>
+  <tr><td><b>Workers</b></td><td>Lambda, <b>scales to zero</b></td><td>EC2 Auto Scaling (Graviton), scales on queue backlog</td></tr>
+  <tr><td><b>Database</b></td><td>Aurora Serverless v2, <b>pauses when idle</b></td><td>Aurora Serverless v2, always on, multi-AZ failover</td></tr>
+  <tr><td><b>Network</b></td><td>No NAT, no VPC endpoints</td><td>Private subnets with no internet route</td></tr>
+  <tr><td><b>Protection</b></td><td>IAM, TLS, AWS-managed encryption</td><td>Adds WAF and a customer KMS key</td></tr>
+  <tr><td><b>Monitoring</b></td><td>2 alarms</td><td>6 alarms + dashboard</td></tr>
+  <tr><td><b>Trade-off</b></td><td>~15 s extra on the first PR after a quiet period</td><td>Fixed monthly cost</td></tr>
+</table>
+
+<p align="center"><sub>AWS infrastructure only, us-east-1, rough. LLM usage is extra: Amazon Bedrock in your account, your own Gemini key, or <code>offline</code> for scanner-only checks.</sub></p>
+
+### Deploy in three commands
+
+```sh
+cd infra/aws_infraestructure
+cp .env.example .env        # DIFFWISE_DEPLOYMENT=small or full, AWS credentials, GitHub orgs
+./deploy.sh                 # builds, plans, asks, applies
+```
+
+Then set the GitHub organization variable `DIFFWISE_API_URL` to the URL it prints. Start on `small` and switch to `full` when you outgrow it. It runs the same code with the same settings; only the database is recreated, from a snapshot.
+
+<details>
+<summary><b>What gets created, and how it stays private</b></summary>
+<br/>
+
+- **Everything lives in your account.** One `.env`, one `terraform apply`, one `./destroy.sh` to remove it all (a final database snapshot is kept).
+- **The database has no open port.** Every component talks to it over the RDS Data API with IAM, and RDS creates and rotates the password.
+- **Secrets stay out of Terraform state.** The Gemini key goes straight to SSM Parameter Store after deploy.
+- **`full` workers have no internet route.** They reach AWS through VPC endpoints and install the service bundle from your own S3 bucket, verified by SHA-256. A NAT gateway is added only if you choose Gemini.
+- **Redeploys are cheap.** The service bundle is built reproducibly, so an unchanged deploy touches nothing.
+
+Full design, costs and security model: [`infra/aws_infraestructure/diffwise-cloud.md`](infra/aws_infraestructure/diffwise-cloud.md). Quick start: [`infra/aws_infraestructure/README.md`](infra/aws_infraestructure/README.md).
+
+</details>
+
+> **Status:** the AWS infrastructure for both sizes is ready. The gate service it runs (`service/`) is in progress: today it answers health checks, and the analysis API is next. A GCP version is planned.
+
+<img src="https://capsule-render.vercel.app/api?type=rect&color=0:EF4444,50:8E75B2,100:22C55E&height=3" width="100%" alt="" />
+
 ## CLI
 
 ```text
@@ -432,6 +493,7 @@ Generated text never contains emojis: the system prompt forbids them, and any th
 | **03** | **Gemini is opt-in and direct** | With your own key, requests go straight from your machine to Google, never through ByePaper. Only the redacted diff, file list, commit subjects and scanner findings are sent. Set `WLU_OFFLINE=1` to guarantee nothing leaves your machine. |
 | **04** | **Secrets redacted first** | Every matched secret becomes `[REDACTED:rule-id]` in the agent diff, the web UI and everything sent to Gemini. |
 | **05** | **Locked-down local server** | Listens only on `127.0.0.1`, rejects foreign `Host` headers (DNS rebinding) and cross-origin writes (CSRF), and serves a strict Content Security Policy. The only external resource is the Mermaid library from jsDelivr; no code or data is sent with it. |
+| **06** | **The PR gate stays in your account** | The [self-hosted AWS gate](#self-host-the-pr-gate-on-aws) runs in your AWS account from your own Terraform. Diffs go from your GitHub runners to your stack, redacted first. No ByePaper endpoint exists in it. |
 
 > **The scanner is a safety net, not a guarantee.** If it finds a real credential, **rotate it**. Deleting it in a later commit does not remove it from git history.
 
