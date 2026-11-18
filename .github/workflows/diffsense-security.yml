@@ -1,0 +1,120 @@
+# Runs the diffsense scanner (this repo's own `wlu scan`) on every change that
+# can reach production: pull requests into main, pushes to main (deploys),
+# published releases, and on demand. Other workflows (e.g. a deploy job) can
+# gate on it with `uses: ./.github/workflows/diffsense-security.yml`.
+name: diffsense security scan
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Base ref to compare against (empty = previous tag, or the first commit)'
+        required: false
+        default: ''
+      fail-on:
+        description: 'Fail at or above this severity'
+        type: choice
+        options: [critical, important, minor, none]
+        default: critical
+  workflow_call:
+    inputs:
+      base:
+        type: string
+        required: false
+        default: ''
+      fail-on:
+        type: string
+        required: false
+        default: critical
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diffsense-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan changes for security issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the merge-base can be computed
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.base_ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          INPUT_BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          first_commit() { git rev-list --max-parents=0 HEAD | tail -n 1; }
+          previous_tag() { git describe --tags --abbrev=0 HEAD^ 2>/dev/null || first_commit; }
+
+          if [ -n "${INPUT_BASE:-}" ]; then
+            base="$INPUT_BASE"
+          elif [ "$EVENT" = "pull_request" ]; then
+            base="origin/$PR_BASE"
+          elif [ "$EVENT" = "push" ] && [ -n "${PUSH_BEFORE:-}" ] \
+               && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"
+          else
+            # release, manual run, new branch or force-push: everything since the last tag
+            base="$(previous_tag)"
+          fi
+          echo "Comparing against: $base"
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Run diffsense scan
+        id: scan
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+          FAIL_ON: ${{ inputs.fail-on || 'critical' }}
+        run: |
+          set +e
+          node bin/wlu.js scan . --base "$BASE" --json --out diffsense-findings.json --fail-on none
+          node bin/wlu.js scan . --base "$BASE" --out diffsense-findings.txt --fail-on "$FAIL_ON"
+          code=$?
+          set -e
+
+          {
+            echo "## diffsense security scan"
+            echo
+            echo "Base: \`$BASE\` · fails on: **$FAIL_ON**"
+            echo
+            echo '```text'
+            cat diffsense-findings.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=diffsense::Findings at or above '$FAIL_ON' severity. See the job summary or the diffsense-report artifact."
+          fi
+          exit "$code"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffsense-report
+          path: |
+            diffsense-findings.json
+            diffsense-findings.txt
+          if-no-files-found: ignore
+          retention-days: 14
