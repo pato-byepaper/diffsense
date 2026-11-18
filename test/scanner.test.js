@@ -2,7 +2,7 @@
 // scannable secret (keeps GitHub push protection and other scanners quiet).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { redactSecrets, scanChanges } from '../src/scanner.js';
+import { globToRegExp, redactSecrets, scanChanges } from '../src/scanner.js';
 
 function fileWith(path, lines, extra = {}) {
   return {
@@ -90,4 +90,66 @@ test('excerpts never contain the raw secret', () => {
   const [f] = scanChanges([fileWith('a.py', ['STRIPE = "sk_' + 'live_51Habcdefghijklmnop1234"'])]);
   assert.ok(!f.excerpt.includes('51Habcdefghijklmnop1234'));
   assert.ok(!f.match.includes('51Habcdefghijklmnop1234'));
+});
+
+test('@diffsense-ignore mutes the line it is on, in any comment style', () => {
+  const lines = [
+    'el.inner' + 'HTML = html; // @diffsense-ignore',
+    'el.inner' + 'HTML = html; /* @diffsense-ignore reviewed */',
+    'el.inner' + 'HTML = html;',
+  ];
+  const f = scanChanges([fileWith('web/a.js', lines)]);
+  assert.deepEqual(f.filter((x) => x.ruleId === 'raw-html-injection').map((x) => x.line), [3]);
+  assert.equal(f.suppressed, 2);
+
+  const py = scanChanges([fileWith('app.py', ['requests.get(url, verify=' + 'False)  # @diffsense-ignore', 'requests.get(url, verify=' + 'False)'])]);
+  assert.deepEqual(py.filter((x) => x.severity === 'critical').map((x) => x.line), [2]);
+});
+
+test('@diffsense-ignore-next-line mutes only the following line', () => {
+  const f = scanChanges([
+    fileWith('src/tls.js', ['// @diffsense-ignore-next-line', 'const agent = { rejectUnauth' + 'orized: false };', 'const b = { rejectUnauth' + 'orized: false };']),
+  ]);
+  assert.deepEqual(f.filter((x) => x.severity === 'critical').map((x) => x.line), [3]);
+});
+
+test('a mention of the marker outside a comment does not mute the line', () => {
+  const f = scanChanges([fileWith('src/a.js', ['el.inner' + 'HTML = "@diffsense-ignore";'])]);
+  assert.ok(ids(f).includes('raw-html-injection'));
+});
+
+test('secrets cannot be muted by comment or by --ignore', () => {
+  const key = '"sk-' + 'ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCD"';
+  const byComment = scanChanges([fileWith('src/k.ts', [`const k = ${key}; // @diffsense-ignore`])]);
+  assert.ok(ids(byComment).includes('anthropic-api-key'));
+  const byPath = scanChanges([fileWith('src/k.ts', [`const k = ${key};`]), fileWith('.env', ['A=1'])], { ignore: ['src/**', '.env'] });
+  assert.ok(ids(byPath).includes('anthropic-api-key'));
+  assert.ok(ids(byPath).includes('env-file-committed'));
+});
+
+test('--ignore globs mute non-secret findings in matching files', () => {
+  const files = [
+    fileWith('src/scanner.js', ['const r = { rejectUnauth' + 'orized: false };']),
+    fileWith('vendor/lib/x.js', ['el.inner' + 'HTML = v;']),
+    fileWith('web/app.js', ['el.inner' + 'HTML = v;']),
+  ];
+  const f = scanChanges(files, { ignore: ['src/scanner.js', 'vendor'] });
+  assert.deepEqual([...new Set(f.filter((x) => x.severity !== 'info').map((x) => x.file))], ['web/app.js']);
+  assert.ok(f.suppressed >= 2);
+  const csv = scanChanges(files, { ignore: ['src/scanner.js,vendor/**,web/*.js'] });
+  assert.equal(csv.filter((x) => x.severity !== 'info').length, 0);
+});
+
+test('globToRegExp follows gitignore-style matching', () => {
+  const m = (glob, p) => globToRegExp(glob).test(p);
+  assert.ok(m('*.snap', 'a/b/c.snap'));
+  assert.ok(!m('*.snap', 'a/b/c.snapx'));
+  assert.ok(m('test/fixtures/', 'test/fixtures/a/b.js'));
+  assert.ok(m('fixtures', 'test/fixtures/b.js'));
+  assert.ok(m('src/*.js', 'src/a.js'));
+  assert.ok(!m('src/*.js', 'src/deep/a.js'));
+  assert.ok(m('src/**/*.js', 'src/a.js'));
+  assert.ok(m('src/**/*.js', 'src/deep/er/a.js'));
+  assert.ok(m('./docs/**', 'docs/x.md'));
+  assert.ok(!m('src/a.js', 'other/src/a.js'));
 });

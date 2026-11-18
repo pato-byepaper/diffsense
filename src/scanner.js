@@ -14,6 +14,50 @@ const CODE = /\.(m?[jt]sx?|cjs|cts|mts|vue|svelte|astro|py|rb|go|rs|java|kt|kts|
 const TEST_FILE = /(^|\/)(__tests__|tests?|spec)\/|\.(test|spec)\.[a-z]+$|_test\.(go|py)$|(^|\/)test_[^/]+\.py$/i;
 const DOC_FILE = /\.(md|mdx|rst|txt|adoc)$/i;
 
+// Inline suppression. A comment holding @diffsense-ignore mutes the line it is on;
+// @diffsense-ignore-next-line mutes the line below. Works with //, /*, #, --, <!--, ;, % and ' comments.
+// Secret findings (keys, tokens, credential files) can never be muted, by comment or by --ignore.
+const IGNORE_COMMENT_RE = /(?:\/\/|\/\*|#|--|<!--|;|%|')\s*@diffs?ense-ignore(-next-line)?\b/;
+
+function ignoreDirective(content) {
+  const m = IGNORE_COMMENT_RE.exec(content);
+  if (!m) return null;
+  return m[1] ? 'next-line' : 'line';
+}
+
+/**
+ * Turns a gitignore-style glob into a RegExp tested against repo-relative paths.
+ *   *  any characters except "/"     **  any characters, including "/"     ?  one character
+ * A pattern without "/" matches at any depth (*.snap, fixtures). A pattern that names a
+ * directory also matches everything inside it (vendor, test/fixtures/).
+ */
+export function globToRegExp(glob) {
+  let g = glob.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  const anchored = g.includes('/');
+  let re = '';
+  for (let i = 0; i < g.length; i++) {
+    const ch = g[i];
+    if (ch === '*') {
+      if (g[i + 1] === '*') {
+        i++;
+        if (g[i + 1] === '/') {
+          i++;
+          re += '(?:.*/)?';
+        } else re += '.*';
+      } else re += '[^/]*';
+    } else if (ch === '?') re += '[^/]';
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`${anchored ? '^' : '(?:^|/)'}${re}(?:/.*)?$`);
+}
+
+function pathMatcher(patterns) {
+  const list = (patterns || []).flatMap((p) => String(p).split(',')).map((p) => p.trim()).filter(Boolean);
+  if (!list.length) return () => false;
+  const res = list.map(globToRegExp);
+  return (filePath) => res.some((re) => re.test(filePath));
+}
+
 /**
  * Rule shape:
  *   id, title, severity, category, description, fix
@@ -150,6 +194,7 @@ export const QUALITY_RULES = [
     title: 'TLS certificate verification disabled',
     severity: 'critical',
     category: 'security',
+    // @diffsense-ignore-next-line: this rule pattern matches its own source
     re: /rejectUnauthorized\s*:\s*false|NODE_TLS_REJECT_UNAUTHORIZED\s*[=:]\s*['"]?0|\bverify\s*=\s*False\b|InsecureSkipVerify\s*:\s*true|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|--insecure\b|curl\s+-k\b/g,
     description: 'Disabling certificate verification allows man-in-the-middle attacks on every request made this way.',
     fix: 'Keep verification on. For private CAs, configure the CA bundle instead.',
@@ -178,6 +223,7 @@ export const QUALITY_RULES = [
     title: 'Lint rule disabled',
     severity: 'minor',
     category: 'lint',
+    // @diffsense-ignore-next-line: this rule pattern matches its own source
     re: /eslint-disable(?:-next-line|-line)?|biome-ignore|#\s*noqa\b|#\s*pylint:\s*disable|\/\/\s*nolint\b|#\[allow\(/g,
     description: 'Disabling a lint rule is sometimes justified but often hides a real defect.',
     fix: 'Fix the lint error, or scope the disable to one rule with a written justification.',
@@ -246,6 +292,7 @@ export const QUALITY_RULES = [
     title: 'Raw HTML injection sink',
     severity: 'important',
     category: 'security',
+    // @diffsense-ignore-next-line: this rule pattern matches its own source
     re: /\.(?:innerHTML|outerHTML)\s*\+?=|dangerouslySetInnerHTML|insertAdjacentHTML\(|document\.write\(|\bv-html=|\{@html\s|\|\s*safe\b|mark_safe\(/g,
     description: 'Writing unsanitized strings as HTML is the main source of cross-site scripting.',
     fix: 'Render text with textContent / framework escaping, or sanitize with a vetted library such as DOMPurify.',
@@ -464,6 +511,7 @@ export function maskSecret(value) {
 function* ruleMatches(rule, text, filePath) {
   if (rule.files && !rule.files.test(filePath)) return;
   if (rule.skipFiles && rule.skipFiles.test(filePath)) return;
+  // @diffsense-ignore-next-line: this rule pattern matches its own source
   // Code-quality rules describe code; prose in docs mentions the same words (e.g. "@ts-ignore").
   if (rule.category !== 'secret' && !rule.docs && DOC_FILE.test(filePath)) return;
   rule.re.lastIndex = 0;
@@ -497,13 +545,22 @@ function excerptOf(content, filePath) {
 /**
  * Scans the added lines of each file.
  * Returns findings sorted by severity, then file, then line.
+ * options.ignore: glob patterns (or comma-separated lists) whose files are not reported.
+ * The returned array carries a non-enumerable `suppressed` count of muted findings.
  */
-export function scanChanges(files) {
+export function scanChanges(files, { ignore = [] } = {}) {
   const findings = [];
   const perRuleFileCount = new Map();
   const MAX_PER_RULE_PER_FILE = 25;
+  const isIgnoredPath = pathMatcher(ignore);
+  let suppressed = 0;
+  let muted = false; // true while the current file or line is muted
 
   const push = (f) => {
+    if (muted && f.category !== 'secret') {
+      suppressed++;
+      return;
+    }
     const key = `${f.ruleId}|${f.file}`;
     const n = (perRuleFileCount.get(key) || 0) + 1;
     perRuleFileCount.set(key, n);
@@ -511,6 +568,8 @@ export function scanChanges(files) {
   };
 
   for (const file of files) {
+    const pathIgnored = isIgnoredPath(file.path);
+    muted = pathIgnored;
     for (const rule of FILE_RULES) {
       if (file.status !== 'deleted' || rule.id === 'test-file-deleted') {
         if (rule.test(file)) {
@@ -521,8 +580,14 @@ export function scanChanges(files) {
     if (file.generated || file.binary) continue;
 
     for (const hunk of file.hunks) {
+      let muteNext = false;
       for (const ln of hunk.lines) {
+        if (ln.type === 'del') continue;
+        const directive = ignoreDirective(ln.content);
+        const mutedByAbove = muteNext;
+        muteNext = directive === 'next-line';
         if (ln.type !== 'add') continue;
+        muted = pathIgnored || mutedByAbove || directive === 'line';
         const content = ln.content;
         if (content.length > 5000) continue; // minified or data blobs
         let lineHasSecret = false;
@@ -571,6 +636,7 @@ export function scanChanges(files) {
   }
 
   const rank = (s) => SEVERITIES.indexOf(s);
+  Object.defineProperty(findings, 'suppressed', { value: suppressed });
   findings.sort((a, b) => rank(a.severity) - rank(b.severity) || a.file.localeCompare(b.file) || (a.line ?? 0) - (b.line ?? 0));
   findings.forEach((f, i) => {
     f.id = `F${i + 1}`;

@@ -63,7 +63,7 @@ function openBrowser(url) {
   execFile(cmd, args, () => {});
 }
 
-export async function startServer({ repoPath, config, open = true, initial = { mode: 'worktree', base: '' } }) {
+export async function startServer({ repoPath, config, open = true, initial = { mode: 'worktree', base: '' }, ignore = [] }) {
   const root = await resolveRepo(repoPath);
   let port = config.port;
 
@@ -77,7 +77,7 @@ export async function startServer({ repoPath, config, open = true, initial = { m
   async function load(opts) {
     const changes = await collectChanges(root, opts);
     cached = { key: JSON.stringify(opts), at: Date.now(), changes };
-    return { changes, findings: scanChanges(changes.files) };
+    return { changes, findings: scanChanges(changes.files, { ignore }) };
   }
   async function changesFor(opts) {
     if (cached && cached.key === JSON.stringify(opts) && Date.now() - cached.at < 10_000) return cached.changes;

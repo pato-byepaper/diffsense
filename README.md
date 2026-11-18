@@ -346,6 +346,7 @@ Options
   --port <n>         Web UI port
   --no-open          Do not open the browser
   --fail-on <level>  scan: exit 1 at or above critical|important|minor (default critical), or none
+  --ignore <glob>    Skip findings in matching files (repeatable or comma-separated). Secrets are always reported
 ```
 
 ## Web UI
@@ -450,6 +451,33 @@ Scans **added lines only**. Lockfiles, minified files and binaries are skipped.
 | <img src="https://img.shields.io/badge/INFO-64748B?style=flat-square" alt="Info"/> | TODO/FIXME, environment variable references, very large file changes |
 
 Rules live in [`src/scanner.js`](src/scanner.js). Adding one takes a few lines; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Ignoring findings
+
+When a finding is intentional, mute it so it stops failing your build.
+
+**One line:** put `@diffsense-ignore` in a comment on that line, or `@diffsense-ignore-next-line` on the line above it. It works with `//`, `/* */`, `#`, `--`, `<!-- -->`, `;`, `%` and `'` comments.
+
+```js
+el.innerHTML = trustedSvg; // @diffsense-ignore: produced by our own renderer
+
+// @diffsense-ignore-next-line
+const agent = new https.Agent({ rejectUnauthorized: false });
+```
+
+```python
+requests.get(url, verify=False)  # @diffsense-ignore
+```
+
+**Whole files or folders:** pass `--ignore` with a gitignore-style glob. Repeat it or separate patterns with commas.
+
+```sh
+wlu scan . --base main --ignore "vendor" --ignore "test/fixtures/**,*.snap"
+```
+
+`*` matches within one folder, `**` matches across folders, and a pattern without `/` matches at any depth.
+
+**Secrets are never muted.** API keys, tokens, private keys and committed `.env` or key files are always reported, so an agent can't hide a leaked key with a comment. The scan output tells you how many findings were ignored.
 
 <img src="https://capsule-render.vercel.app/api?type=rect&color=0:EF4444,50:8E75B2,100:22C55E&height=3" width="100%" alt="" />
 

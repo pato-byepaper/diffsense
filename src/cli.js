@@ -41,6 +41,8 @@ Options
   --port <n>         Web UI port (default: WLU_PORT or 4747)
   --no-open          Do not open the browser
   --fail-on <level>  scan: exit 1 if a finding at or above level exists (critical|important|minor|none, default critical)
+  --ignore <glob>    Do not report findings in matching files (repeatable or comma-separated,
+                     e.g. --ignore "test/fixtures/**,*.snap"). Secrets are always reported.
   -h, --help         Show help
   -v, --version      Show version
 
@@ -49,11 +51,15 @@ Examples
   wlu diff ../my-app --base main --out changes.md
   wlu issues ../my-app --base main > issues.md
   wlu scan . --staged --fail-on important     (pre-commit hook)
+  wlu scan . --base main --ignore "vendor,docs/**"
+
+Ignore a single line with a comment containing @diffsense-ignore on that line,
+or @diffsense-ignore-next-line on the line above it (// # -- /* <!-- ; % all work).
 `;
 
 export function parseArgs(argv) {
-  const opts = { _: [] };
-  const valueFlags = new Set(['base', 'file', 'out', 'model', 'port', 'fail-on']);
+  const opts = { _: [], ignore: [] };
+  const valueFlags = new Set(['base', 'file', 'out', 'model', 'port', 'fail-on', 'ignore']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') opts.help = true;
@@ -64,7 +70,8 @@ export function parseArgs(argv) {
       else if (valueFlags.has(k)) {
         const v = inline ?? argv[++i];
         if (v === undefined || (inline === undefined && v.startsWith('--'))) throw new Error(`--${k} needs a value`);
-        opts[k] = v;
+        if (k === 'ignore') opts.ignore.push(v);
+        else opts[k] = v;
       } else opts[k] = true;
     } else opts._.push(a);
   }
@@ -92,7 +99,8 @@ async function emit(text, opts) {
 const SEV_COLOR = { critical: c.red, important: c.yellow, minor: c.cyan, info: c.dim };
 
 function formatFindings(findings) {
-  if (!findings.length) return `${c.green('No findings.')}\n`;
+  const muted = findings.suppressed ? c.dim(`${findings.suppressed} finding(s) ignored by --ignore or @diffsense-ignore.\n`) : '';
+  if (!findings.length) return `${c.green('No findings.')}\n${muted}`;
   const out = [];
   for (const sev of SEVERITIES) {
     const list = findings.filter((f) => f.severity === sev);
@@ -105,7 +113,7 @@ function formatFindings(findings) {
   }
   const counts = countBySeverity(findings);
   out.push(`\n${SEVERITIES.map((s) => SEV_COLOR[s](`${counts[s]} ${s}`)).join('  ')}\n`);
-  return out.join('\n');
+  return out.join('\n') + muted;
 }
 
 async function readVersion() {
@@ -140,12 +148,12 @@ export async function main(argv) {
 
   if (command === 'serve') {
     const { startServer } = await import('./server.js');
-    await startServer({ repoPath: opts.repo, config, open: opts.open !== false, initial: changeOptions(opts) });
+    await startServer({ repoPath: opts.repo, config, open: opts.open !== false, initial: changeOptions(opts), ignore: opts.ignore });
     return new Promise(() => {}); // keep running until Ctrl+C
   }
 
   const changes = await collectChanges(opts.repo, changeOptions(opts));
-  const findings = scanChanges(changes.files);
+  const findings = scanChanges(changes.files, { ignore: opts.ignore });
 
   if (command === 'diff') {
     const text = opts.json ? JSON.stringify({ ...changes, findings }, null, 2) : buildAgentDocument(changes, findings);

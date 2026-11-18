@@ -22,6 +22,10 @@ on:
         type: choice
         options: [critical, important, minor, none]
         default: critical
+      ignore:
+        description: 'Comma-separated globs to skip (secrets are always reported)'
+        required: false
+        default: ''
   workflow_call:
     inputs:
       base:
@@ -32,6 +36,10 @@ on:
         type: string
         required: false
         default: critical
+      ignore:
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -86,10 +94,11 @@ jobs:
         env:
           BASE: ${{ steps.base.outputs.ref }}
           FAIL_ON: ${{ inputs.fail-on || 'critical' }}
+          IGNORE: ${{ inputs.ignore }}
         run: |
           set +e
-          node bin/wlu.js scan . --base "$BASE" --json --out diffsense-findings.json --fail-on none
-          node bin/wlu.js scan . --base "$BASE" --out diffsense-findings.txt --fail-on "$FAIL_ON"
+          node bin/wlu.js scan . --base "$BASE" --ignore "$IGNORE" --json --out diffsense-findings.json --fail-on none
+          node bin/wlu.js scan . --base "$BASE" --ignore "$IGNORE" --out diffsense-findings.txt --fail-on "$FAIL_ON"
           code=$?
           set -e
 
