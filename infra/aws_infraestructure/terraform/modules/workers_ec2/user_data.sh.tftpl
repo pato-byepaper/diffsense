@@ -1,0 +1,73 @@
+#!/bin/bash
+# diffwise worker bootstrap (Amazon Linux 2023). Rendered by Terraform.
+set -euo pipefail
+
+dnf install -y nodejs22 unzip amazon-cloudwatch-agent
+
+# Service bundle from the stack's own bucket, verified before it is unpacked.
+aws s3 cp "s3://${artifact_bucket}/${artifact_key}" /tmp/diffwise.zip --region "${region}"
+echo "${artifact_sha256}  /tmp/diffwise.zip" | sha256sum -c -
+rm -rf /opt/diffwise && mkdir -p /opt/diffwise
+unzip -q /tmp/diffwise.zip -d /opt/diffwise
+rm -f /tmp/diffwise.zip
+
+id diffwise >/dev/null 2>&1 || useradd --system --home-dir /opt/diffwise --shell /sbin/nologin diffwise
+install -d -o diffwise -g diffwise -m 0750 /var/log/diffwise
+install -d -m 0750 /etc/diffwise
+
+cat > /etc/diffwise/worker.env <<'ENV'
+AWS_REGION=${region}
+%{ for k, v in env ~}
+${k}=${v}
+%{ endfor ~}
+ENV
+chmod 0640 /etc/diffwise/worker.env
+chgrp diffwise /etc/diffwise/worker.env
+
+NODE_BIN="$(command -v node-22 || command -v node)"
+
+cat > /etc/systemd/system/diffwise-worker.service <<UNIT
+[Unit]
+Description=diffwise analysis worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=diffwise
+WorkingDirectory=/opt/diffwise
+EnvironmentFile=/etc/diffwise/worker.env
+ExecStart=$NODE_BIN /opt/diffwise/service/worker-ec2.js
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=900
+StandardOutput=append:/var/log/diffwise/worker.log
+StandardError=append:/var/log/diffwise/worker.log
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/diffwise
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/diffwise.json <<'CWA'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          { "file_path": "/var/log/diffwise/worker.log", "log_group_name": "${log_group}", "log_stream_name": "{instance_id}" }
+        ]
+      }
+    }
+  }
+}
+CWA
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/diffwise.json
+
+systemctl daemon-reload
+systemctl enable --now diffwise-worker

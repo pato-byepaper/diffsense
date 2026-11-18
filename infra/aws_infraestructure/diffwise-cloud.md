@@ -9,7 +9,11 @@ Design document for running diffwise as a PR gate **inside your own AWS account*
 | Status  | Draft                  |
 | Owner   | pato-byepaper          |
 | Created | 2026-11-04             |
+| Updated | 2026-11-18             |
 | Version | Targets diffwise 2.0.0 |
+| Code    | `infra/aws_infraestructure/` (Terraform, `deploy.sh`, `.env.example`) |
+
+AWS lives in `infra/aws_infraestructure/`. A GCP version will live next to it in its own `infra/gcp_*` folder and reuse the same `service/` code.
 
 ---
 
@@ -24,7 +28,8 @@ Design document for running diffwise as a PR gate **inside your own AWS account*
 - **Smart gating that understands intent.** The decision looks at the diff, the PR description and the client release notes, and checks that all three agree.
 - **Central policy, per-repo overrides.** The platform team sets a baseline for the whole organization; repositories can tighten it, and loosen it only where the baseline allows.
 - **Auditable.** Every decision, override and policy version is stored in the user's own database.
-- **Clean teardown.** `terraform destroy` removes everything.
+- **Two deployment types.** `small` costs a few USD a month for startups; `full` is the production layout (section 3.6).
+- **Clean teardown.** `./destroy.sh` (`terraform destroy`) removes everything.
 
 ### Non-goals (v2)
 
@@ -48,7 +53,7 @@ flowchart LR
     end
 
     subgraph AWS["Your AWS account"]
-        STACK[diffwise stack: API Gateway, Lambda, SQS, EC2, RDS, S3]
+        STACK[diffwise stack: API Gateway, Lambda, SQS, EC2 or Lambda workers, Aurora, S3]
     end
 
     LLM[LLM: Amazon Bedrock in your account, or your own Gemini key, or none]
@@ -67,8 +72,8 @@ The only data that leaves your AWS account is what you choose to send to an LLM:
 
 | LLM option                     | Where the redacted diff goes                                      | Internet egress needed |
 | ------------------------------ | ----------------------------------------------------------------- | ---------------------- |
-| **Amazon Bedrock** (default)   | Bedrock in your own account and region, through a VPC endpoint.   | No                     |
-| **Gemini** (your API key)      | Google Gemini API, directly from your workers.                    | Yes (NAT gateway)      |
+| **Amazon Bedrock** (default)   | Bedrock in your own account and region (VPC endpoint in `full`).  | No                     |
+| **Gemini** (your API key)      | Google Gemini API, directly from your workers.                    | `full`: NAT gateway. `small`: none (Lambda) |
 | **Offline**                    | Nowhere. Scanner and deterministic checks only.                    | No                     |
 
 ---
@@ -77,83 +82,72 @@ The only data that leaves your AWS account is what you choose to send to an LLM:
 
 ### 3.1 Prerequisites
 
-- Terraform 1.9+ and Node.js 22+ on the machine that deploys.
-- An AWS account (a dedicated one is recommended) and credentials allowed to create VPC, IAM, Lambda, API Gateway, SQS, EC2, RDS, S3, KMS, Secrets Manager and CloudWatch resources.
-- An S3 bucket for Terraform state (or let the bootstrap step create one).
+- Terraform 1.10+, the AWS CLI v2, `zip` and Node.js 22+ on the machine that deploys.
+- An AWS account (a dedicated one is recommended) and credentials allowed to create the resources below. A starting deployer policy is in `terraform/deployer-policy.json` (replace the two `REPLACE_WITH_*` values).
 - If using Bedrock: model access enabled for the chosen model in the chosen region.
+
+The Terraform state bucket is created by `deploy.sh` if it does not exist (private, versioned, encrypted; S3-native locking, no DynamoDB table).
 
 ### 3.2 `.env`
 
-The deploy reads a `.env` in the folder where diffwise is cloned. It is already covered by `.gitignore`.
+`deploy.sh` reads `infra/aws_infraestructure/.env` (gitignored). Start from [`.env.example`](.env.example):
 
 ```sh
-# --- AWS credentials (used only on this machine, only by Terraform) ---
-AWS_ACCESS_KEY_ID=
+DIFFWISE_DEPLOYMENT=small                 # small | full (section 3.6)
+
+AWS_ACCESS_KEY_ID=                        # or AWS_PROFILE / AWS_SESSION_TOKEN
 AWS_SECRET_ACCESS_KEY=
-# AWS_SESSION_TOKEN=          # if using temporary credentials (recommended)
-# AWS_PROFILE=                # alternative to the keys above (SSO / named profile)
 AWS_REGION=us-east-1
 
-# --- Terraform state ---
 DIFFWISE_TF_STATE_BUCKET=acme-diffwise-tfstate
 DIFFWISE_ENVIRONMENT=prod                 # prefix for every resource name
+DIFFWISE_ALLOWED_GITHUB_ORGS=acme,acme-labs
 
-# --- Who may call the gate ---
-DIFFWISE_ALLOWED_GITHUB_ORGS=acme,acme-labs   # OIDC tokens from any other org are rejected
-
-# --- LLM ---
 DIFFWISE_LLM_PROVIDER=bedrock             # bedrock | gemini | offline
-DIFFWISE_BEDROCK_MODEL_ID=                # e.g. an Anthropic Claude model id available in your region
-# GEMINI_API_KEY=                         # only if DIFFWISE_LLM_PROVIDER=gemini
-# GEMINI_MODEL=gemini-3.8-flash
-
-# --- Sizing (optional) ---
-# DIFFWISE_WORKER_INSTANCE_TYPE=c7g.large
-# DIFFWISE_WORKER_MIN=1
-# DIFFWISE_WORKER_MAX=10
-# DIFFWISE_DB_INSTANCE_CLASS=db.t4g.medium
-# DIFFWISE_DB_MULTI_AZ=true
-# DIFFWISE_REPORT_RETENTION_DAYS=30
+DIFFWISE_BEDROCK_MODEL_ID=
+# GEMINI_API_KEY=                         # only for gemini; written to SSM, never to Terraform state
 ```
 
-Credential guidance in the docs:
+Every sizing value (`DIFFWISE_DB_MAX_ACU`, `DIFFWISE_WORKER_MAX`, ...) is optional and overrides the preset of the chosen deployment type.
+
+Credential guidance:
 
 - Prefer temporary credentials (`AWS_SESSION_TOKEN` or `AWS_PROFILE` with SSO) over long-lived access keys.
-- The credentials are used only by Terraform on the deploy machine. They are never put in GitHub, never stored in Terraform state, and never used by the running stack. The stack runs on IAM roles that Terraform creates.
-- A ready-made least-privilege IAM policy for the deployer is shipped as `infra/terraform/deployer-policy.json`.
+- The credentials are used only by Terraform and the AWS CLI on the deploy machine. They are never put in GitHub, never stored in Terraform state, and never used by the running stack. The stack runs on IAM roles that Terraform creates.
 
 ### 3.3 Deploy
 
 ```sh
 git clone https://github.com/pato-byepaper/diffwise.git
-cd diffwise
+cd diffwise/infra/aws_infraestructure
 cp .env.example .env          # fill in the values above
-wlu cloud deploy              # loads .env, runs terraform init + plan, asks, then applies
+./deploy.sh                   # builds the service bundle, terraform init + plan, asks, then applies
 ```
 
-`wlu cloud deploy` is a thin wrapper. It loads `.env`, maps the `DIFFWISE_*` values to `TF_VAR_*`, and runs plain Terraform in `infra/terraform`. Teams that already have a Terraform workflow can skip the wrapper and use the module directly:
+`deploy.sh` is a thin wrapper (a future `wlu cloud deploy` will call the same steps). It loads `.env`, maps the `DIFFWISE_*` values to `TF_VAR_*`, builds a reproducible `build/service.zip` (`src/`, `prompts/`, `service/`, `package.json`) and runs plain Terraform in `terraform/`. `./deploy.sh --plan-only` stops after the plan; `./deploy.sh --yes` applies without asking (CI).
+
+Teams that already have a Terraform workflow can use the module directly (build the bundle first):
 
 ```hcl
 module "diffwise" {
-  source = "github.com/pato-byepaper/diffwise//infra/terraform?ref=v2.0.0"
+  source = "github.com/pato-byepaper/diffwise//infra/aws_infraestructure/terraform?ref=v2.0.0"
 
-  environment          = "prod"
-  allowed_github_orgs  = ["acme", "acme-labs"]
-  llm_provider         = "bedrock"
-  bedrock_model_id     = var.bedrock_model_id
-  report_retention_days = 30
-}
-
-output "diffwise_api_url" {
-  value = module.diffwise.api_url
+  aws_region          = "us-east-1"
+  environment         = "prod"
+  deployment          = "small"            # or "full"
+  allowed_github_orgs = ["acme", "acme-labs"]
+  llm_provider        = "bedrock"
+  bedrock_model_id    = var.bedrock_model_id
+  service_zip_path    = "${path.root}/build/service.zip"
 }
 ```
 
 When apply finishes it prints:
 
 ```text
-diffwise_api_url = "https://abc123.execute-api.us-east-1.amazonaws.com"
-next_step        = "Set the GitHub organization variable DIFFWISE_API_URL to this value."
+diffwise_api_url = "https://abc123.execute-api.us-east-1.amazonaws.com/live"
+health_check_url = "https://abc123.execute-api.us-east-1.amazonaws.com/live/healthz"
+next_step        = "Set the GitHub organization variable DIFFWISE_API_URL to ..."
 ```
 
 ### 3.4 Connect GitHub
@@ -166,9 +160,30 @@ next_step        = "Set the GitHub organization variable DIFFWISE_API_URL to thi
 
 ```sh
 git pull && git checkout v2.1.0
-wlu cloud deploy              # terraform apply with the new module version; DB migrations run as part of it
-wlu cloud destroy             # terraform destroy; asks for confirmation, keeps a final RDS snapshot by default
+./deploy.sh                   # same bundle = no Lambda redeploy and no EC2 rollout
+./destroy.sh                  # terraform destroy; asks for confirmation, keeps a final Aurora snapshot
 ```
+
+Switching `DIFFWISE_DEPLOYMENT` between `small` and `full` is a `./deploy.sh` with the new value. Compute, endpoints, WAF and alarms change in place. **The Aurora cluster is replaced**, because its encryption key changes (AWS-managed vs customer KMS): Terraform deletes it after taking the final snapshot and creates an empty one. Check the plan, and restore from the snapshot if you need the history. Choosing the type before storing data you care about avoids this.
+
+### 3.6 Deployment types: `small` and `full`
+
+| | **small** (startups, default) | **full** (production) |
+|:---|:---|:---|
+| Who it is for | Small teams, up to a few thousand PRs a month, tight budget | Larger orgs, steady load, compliance needs |
+| Workers | Lambda on the SQS queue (15 min max per job) | EC2 Auto Scaling group (Graviton `c7g.large`), private subnets, scales on queue backlog |
+| Database | Aurora PostgreSQL Serverless v2, **0 to 2 ACU, pauses after 5 idle minutes** | Aurora Serverless v2, 0.5 to 8 ACU, never pauses, reader in a second AZ for failover |
+| Database access | RDS Data API (HTTPS + IAM), no open port | Same |
+| Network | VPC only to hold the database. No NAT, no endpoints | VPC endpoints (SQS, SSM, Logs, RDS Data, Bedrock, S3); NAT only for Gemini |
+| API | API Gateway REST + Lambda | Same, plus AWS WAF (rate limit + AWS managed rules) |
+| Encryption | AWS-managed keys | Customer KMS key with rotation |
+| Monitoring | 2 alarms (failed jobs, stuck queue) | 6 alarms + dashboard |
+| Logs kept | 7 days | 30 days |
+| Reports kept | 14 days | 30 days |
+| Cold start | First request after an idle period waits ~15 s for the database to resume | None |
+| Rough cost | **~1-2 USD idle, ~2-10 USD/month typical** | ~330 USD/month |
+
+Both run the same `service/` code with the same environment variables, so a team can start on `small` and move to `full` without changing the Action or the policy files.
 
 ---
 
@@ -176,78 +191,82 @@ wlu cloud destroy             # terraform destroy; asks for confirmation, keeps 
 
 ```mermaid
 flowchart LR
-    A[diffwise-action in GitHub runner] -->|HTTPS + OIDC JWT| WAF
+    A[diffwise-action in GitHub runner] -->|HTTPS + OIDC JWT| APIGW
 
     subgraph AWS["Your AWS account"]
-        WAF[AWS WAF] --> APIGW[API Gateway HTTP API]
+        WAF[AWS WAF, full only] -.-> APIGW[API Gateway REST API]
         APIGW --> L1[Lambda: api]
         L1 --> SQS[(SQS: analyses)]
         SQS --> DLQ[(SQS: analyses-dlq)]
-        SQS --> ASG[EC2 Auto Scaling Group: workers]
-        L1 --> RDSP[RDS Proxy]
-        ASG --> RDSP
-        RDSP --> RDS[(RDS PostgreSQL)]
-        ASG --> S3[(S3: reports)]
+        SQS --> W[Workers: Lambda in small, EC2 ASG in full]
+        L1 -->|Data API| RDS[(Aurora PostgreSQL Serverless v2)]
+        W -->|Data API| RDS
+        W --> S3[(S3: reports)]
         L1 --> S3
-        ASG --> SM[Secrets Manager]
-        ASG -->|VPC endpoint| BR[Amazon Bedrock]
+        W --> SSM[SSM Parameter Store: Gemini key]
+        W --> BR[Amazon Bedrock]
         EB[EventBridge schedule] --> L2[Lambda: maintenance]
-        L2 --> RDSP
+        L2 --> RDS
         L2 --> S3
         CW[CloudWatch logs, metrics, alarms]
     end
 
-    ASG -.->|only if provider = gemini, via NAT| GEM[Gemini API]
+    W -.->|only if provider = gemini| GEM[Gemini API]
 ```
 
 ### Components
 
-| Component                     | Why this service                                                                                                         | Responsibilities                                                                                      |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| **API Gateway (HTTP API)**    | Managed TLS, throttling, cheap at PR-level traffic. Optional custom domain via an input variable.                         | Routing, per-route throttling, request size limit.                                                    |
-| **AWS WAF**                   | Rejects abusive traffic before it costs Lambda time.                                                                     | Rate limit per IP, AWS managed rule sets, body size rule. Optional (`enable_waf`).                    |
-| **Lambda `api`**              | Short, bursty requests; scales to zero between PR spikes.                                                                | OIDC verification, allowed-org check, enqueue, status polling, policy and override endpoints.        |
-| **SQS + DLQ**                 | Decouples intake from analysis and absorbs PR spikes.                                                                    | At-least-once delivery, visibility timeout 15 min, 3 attempts then DLQ.                               |
-| **EC2 Auto Scaling Group**    | Large diffs take minutes, several LLM calls run concurrently, warm connection pools.                                     | Worker process: LLM tasks, cross-checks, policy engine, writes results.                               |
-| **RDS PostgreSQL**            | Relational data with strong consistency: policies with versions, decisions, overrides, audit log.                         | System of record. Multi-AZ optional (`db_multi_az`).                                                  |
-| **RDS Proxy**                 | Lambda concurrency would otherwise exhaust Postgres connections.                                                         | Connection pooling, IAM database auth.                                                                |
-| **S3**                        | Full Markdown reports do not belong in table rows.                                                                       | Generated reports. SSE-KMS, lifecycle expiry from `report_retention_days`. Public access blocked.     |
-| **KMS**                       | One customer-managed key for the stack.                                                                                  | Encrypts RDS, S3, SQS, Secrets Manager and CloudWatch logs.                                           |
-| **Secrets Manager**           | Keeps the Gemini key (if used) and DB admin credentials out of code and user data.                                        | Read by workers at start-up through their IAM role.                                                   |
-| **Lambda `maintenance`**      | Scheduled housekeeping.                                                                                                  | Purge expired rows and reports, roll up metrics.                                                      |
-| **CloudWatch**                | Default AWS observability.                                                                                               | Logs (no diff content), metrics, alarms, one dashboard. Alarm emails go to `alarm_email` if set.     |
+| Component | Why this service | Responsibilities |
+| --- | --- | --- |
+| **API Gateway (REST, regional)** | Managed TLS and throttling. REST rather than HTTP API because AWS WAF can only be attached to REST APIs; at PR-level traffic the price difference is cents. | `{proxy+}` to the api Lambda, stage throttling (20 rps, burst 40). |
+| **AWS WAF** (full) | Rejects abusive traffic before it costs Lambda time. | Rate limit per IP, `CommonRuleSet` and `KnownBadInputs`. Body-inspecting rules are set to **count**, because request bodies are code diffs and would trip XSS/LFI/size rules. |
+| **Lambda `api`** | Short, bursty requests; scales to zero. Runs outside the VPC in both types. | OIDC verification, allowed-org check, enqueue, status polling, policy and override endpoints. |
+| **SQS + DLQ** | Decouples intake from analysis and absorbs PR spikes. | Visibility timeout 16 min, 3 attempts then DLQ, 4-day retention. |
+| **Workers** | small: Lambda on the queue (0 USD idle). full: EC2 for long jobs, warm pools and steady load. | LLM tasks, cross-checks, policy engine, writes results. |
+| **Aurora PostgreSQL Serverless v2** | Relational data with strong consistency: versioned policies, decisions, overrides, audit log. Serverless v2 can pause at 0 ACU (small). | System of record. Encrypted. Password created and rotated by RDS in Secrets Manager. |
+| **RDS Data API** | Connection pooling as a managed HTTPS API. Replaces RDS Proxy (which costs ~90 USD/month on Serverless v2 and blocks auto-pause), and lets Lambdas stay out of the VPC. | All database access from every component, authorized by IAM. The database security group has **no ingress rules**. |
+| **S3** | Full Markdown reports do not belong in table rows. | `reports/` with lifecycle expiry, `artifacts/` with the EC2 service bundle. Public access blocked, TLS-only policy. |
+| **KMS** (full) | One customer-managed key for the stack, rotated yearly. | Encrypts Aurora, S3, SQS, the Gemini parameter, CloudWatch logs and the alarm topic. small uses AWS-managed keys (free). |
+| **SSM Parameter Store** | Free SecureString storage for the Gemini key. | Written by `deploy.sh` after apply, so the key never enters Terraform state. |
+| **Lambda `maintenance`** | Scheduled housekeeping (daily in small, hourly in full). | Purge expired rows and reports, roll up metrics. |
+| **CloudWatch + SNS** | Default AWS observability. | Logs (no diff content), alarms, dashboard (full). Alarm emails go to `DIFFWISE_ALARM_EMAIL` if set. |
 
-### EC2 workers
+### EC2 workers (full)
 
-- **Instance:** `c7g.large` (Graviton) by default. Workers are I/O bound on LLM calls.
-- **Image:** latest Amazon Linux 2023 AMI looked up by Terraform. User data installs Node.js and the diffwise release tarball for the exact pinned version from GitHub Releases, verified against its SHA-256 checksum, and runs the worker as a systemd unit.
-- **Scaling:** target tracking on queue depth per instance (default 4 jobs per instance), min and max from `.env`.
-- **Access:** no SSH and no public IP. SSM Session Manager only.
-- **Network:** private subnets. With Bedrock or offline, no NAT gateway is created and the stack has no route to the internet at all; AWS services are reached through VPC endpoints. With Gemini, Terraform adds a NAT gateway.
-- **Graceful shutdown:** lifecycle hook drains in-flight jobs before termination.
-
-> Alternative considered: ECS Fargate for workers. It removes instance management but costs more at steady load. The worker is a plain Node process, so a `worker_runtime = "fargate"` option can be added later without a rewrite.
+- **Instance:** `c7g.large` (Graviton) by default. Workers are I/O bound on LLM calls. Architecture (arm64 or x86_64) follows the instance type.
+- **Image:** latest Amazon Linux 2023, resolved by the launch template from the public SSM parameter. User data installs Node.js 22 from the AL2023 repositories and the service bundle from the stack's own S3 bucket, **verified against its SHA-256**, and runs the worker as a hardened systemd unit.
+- **Scaling:** target tracking on queue backlog per instance (default 4 jobs per instance), min and max from `.env`.
+- **Access:** no SSH and no public IP. SSM Session Manager only. IMDSv2 required.
+- **Network:** private subnets. With Bedrock or offline, there is no route to the internet at all: AWS services are reached through VPC endpoints, and packages and the bundle through the free S3 gateway endpoint. With Gemini, Terraform adds one NAT gateway.
+- **Graceful shutdown:** a terminating lifecycle hook gives the worker up to 16 minutes. The worker reads the `Terminated` target state from instance metadata, stops taking jobs and finishes the current one.
+- **Rollout:** a new bundle changes the launch template and triggers a rolling instance refresh (50% kept healthy).
 
 ### Terraform layout
 
 ```text
-infra/terraform/
-  main.tf                 Root module wiring
-  variables.tf            All inputs (mapped from .env by wlu cloud deploy)
-  outputs.tf              api_url, dashboard_url, next_step
-  versions.tf             Provider pins, S3 backend
-  deployer-policy.json    Least-privilege IAM policy for whoever runs apply
-  modules/
-    network/              VPC, private subnets, VPC endpoints, optional NAT
-    data/                 KMS, RDS, RDS Proxy, S3 reports bucket
-    queue/                SQS + DLQ
-    api/                  API Gateway, WAF, api Lambda, IAM role
-    workers/              Launch template, ASG, scaling policies, IAM role
-    maintenance/          EventBridge schedule + Lambda
-    observability/        Log groups, alarms, dashboard, SNS topic
+infra/aws_infraestructure/
+  .env.example            Settings and credentials template
+  deploy.sh / destroy.sh  Wrappers: load .env, build bundle, terraform
+  scripts/common.sh       Shared helpers
+  diffwise-cloud.md       This document
+  terraform/
+    main.tf               Presets (small | full) and module wiring
+    variables.tf          All inputs (mapped from .env by deploy.sh)
+    outputs.tf            diffwise_api_url, health_check_url, dashboard_url, next_step
+    versions.tf           Provider pins, S3 backend (native locking)
+    deployer-policy.json  Starting IAM policy for whoever runs apply
+    modules/
+      network/            VPC, private subnets, optional endpoints and NAT
+      core/               KMS (full), S3 reports, SQS + DLQ, Gemini parameter
+      database/           Aurora Serverless v2 + Data API
+      api/                API Gateway REST, api Lambda, WAF (full)
+      workers_lambda/     small: SQS-triggered Lambda
+      workers_ec2/        full: launch template, ASG, scaling, lifecycle hook
+      maintenance/        EventBridge schedule + Lambda
+      observability/      SNS topic, alarms, dashboard
 ```
 
-Every resource is tagged `app = diffwise` and `environment = <DIFFWISE_ENVIRONMENT>`, and every name is prefixed, so several environments (for example `staging` and `prod`) can live in one account.
+Every resource is tagged `app = diffwise`, `environment = <DIFFWISE_ENVIRONMENT>` and `deployment = small|full`, and every name is prefixed, so several environments (for example `staging` and `prod`) can live in one account.
 
 ---
 
@@ -536,7 +555,7 @@ The `diff` is redacted by `src/scanner.js` in the runner. The API re-runs the se
 
 ---
 
-## 8. Data model (RDS PostgreSQL)
+## 8. Data model (Aurora PostgreSQL)
 
 One installation serves one company, so there is no cross-customer tenancy. `repos` still separates teams inside the organization.
 
@@ -616,7 +635,7 @@ erDiagram
 - Unique index on `analyses (repo_id, head_sha, base_sha, policy_hash)` backs the cache and makes duplicate SQS deliveries idempotent.
 - `signals.message` stores finding text, never code excerpts. The redacted diff exists only in the SQS message and worker memory.
 - `audit_log` is append-only (no `UPDATE` / `DELETE` grants for the app role).
-- Migrations run during `terraform apply` through a one-off Lambda invoked by Terraform after the database is ready, never on cold starts.
+- Migrations run during `terraform apply` through a one-off Lambda invoked by Terraform after the database is ready, never on cold starts. They go through the Data API like every other query.
 
 ---
 
@@ -629,12 +648,12 @@ erDiagram
 | Secrets in diffs                | Redacted in the runner by the existing scanner; re-checked at the API; request rejected if any secret pattern survives.                         |
 | Code at rest                    | Not stored. Diff text lives only in the SQS message (SSE-KMS, deleted on success, max 4-day retention) and worker memory.                       |
 | Reports at rest                 | S3 with SSE-KMS, public access blocked, lifecycle expiry from `report_retention_days` (set `0` to keep only the PR comment).                    |
-| Terraform state                 | S3 backend with encryption and versioning. Sensitive inputs (Gemini key) are marked `sensitive`; the docs recommend writing the key to Secrets Manager after apply so it never enters state. |
+| Terraform state                 | S3 backend with encryption, versioning and native locking. The Gemini key never passes through Terraform: `deploy.sh` writes it to an SSM SecureString after apply. The database password is created by RDS in Secrets Manager. |
 | Authentication                  | GitHub OIDC JWT verified against GitHub's JWKS. `aud` must equal `diffwise`; `repository_owner` must be in `allowed_github_orgs`.               |
 | LLM                             | Bedrock keeps traffic in your account through a VPC endpoint. Gemini uses your own key. Offline sends nothing.                                  |
 | Prompt injection from the diff  | Diff content is wrapped as data; LLM output is parsed into a strict schema; the LLM can only produce signals, never change policy.              |
 | Fork PRs                        | Forks get no `id-token: write`, so the Action runs scanner-only locally. Never `pull_request_target`.                                           |
-| Network                         | Workers and RDS in private subnets, no public IPs. With Bedrock or offline, no internet route exists at all.                                    |
+| Network                         | Aurora in private subnets with no ingress rules (Data API only). full: EC2 workers in private subnets, no public IPs; with Bedrock or offline, no internet route exists at all. small: no compute runs inside the VPC. |
 | Logging                         | Logs contain IDs, counts and timings only. A test fails CI if diff or PR body fields are ever logged.                                           |
 | Supply chain                    | Terraform module and worker tarball pinned by version tag and SHA-256 checksum. Provider versions pinned in `versions.tf`.                      |
 
@@ -646,9 +665,10 @@ The README and `SECURITY.md` keep their current promise unchanged: ByePaper neve
 
 ### Defaults Terraform sets up
 
-- **Alarms:** DLQ depth above 0, oldest message older than 5 minutes, worker error rate above 5%, LLM error rate above 10%, RDS CPU above 70% or free storage below 20%. Sent to an SNS topic, with email if `alarm_email` is set.
-- **Dashboard:** analyses per hour, decisions by outcome, p50/p95 latency, LLM tokens, queue depth.
-- **Backups:** RDS automated backups (7 days default), final snapshot on destroy.
+- **Alarms (both):** DLQ depth above 0, oldest message older than 5 minutes.
+- **Alarms (full):** API 5xx rate above 5%, api Lambda errors, Aurora ACU utilization above 80%, queue backing up with workers at max. All go to an SNS topic, with email if `DIFFWISE_ALARM_EMAIL` is set.
+- **Dashboard (full):** queue depth, API requests and errors, p50/p95 latency, workers, database ACU.
+- **Backups:** Aurora automated backups (1 day small, 7 days full), final snapshot on destroy.
 
 ### Target latency
 
@@ -656,22 +676,35 @@ The README and `SECURITY.md` keep their current promise unchanged: ByePaper neve
 | ------------------------------------------- | --------------- |
 | Decision p50 / p95 (diffs under 2k lines)   | 45 s / 3 min    |
 | Scanner-only decision when the LLM is down  | under 20 s      |
+| small: extra wait after an idle period      | ~15 s (database resume) |
 
-### Rough AWS cost (your bill, ~20k analyses/month)
+### Rough AWS cost: `small` (your bill, us-east-1)
+
+| Item                                         | Monthly (USD, rough) |
+| -------------------------------------------- | -------------------- |
+| Aurora storage (a few GB) + backups          | 0.30-1               |
+| Aurora compute while awake (0.5-2 ACU, only during PR activity) | 0-8 |
+| Secrets Manager (database password)          | 0.40                 |
+| Lambda + API Gateway + SQS + S3              | 0-1 (mostly free tier) |
+| CloudWatch alarms (2) and logs (7 days)      | 0.20-0.50            |
+| **Infrastructure total**                     | **~1-2 idle, ~2-10 typical** |
+| LLM usage                                    | Depends on model and diff size |
+
+There is no NAT gateway, VPC endpoint, EC2 instance, WAF or KMS key in `small`, which are the usual fixed costs of an AWS stack.
+
+### Rough AWS cost: `full` (your bill, ~20k analyses/month)
 
 | Item                                         | Monthly (USD, rough) |
 | -------------------------------------------- | -------------------- |
 | EC2 workers (avg 2 x c7g.large)              | 105                  |
-| RDS PostgreSQL db.t4g.medium (Multi-AZ)      | 140                  |
-| RDS Proxy                                    | 25                   |
-| VPC interface endpoints                      | 50                   |
+| Aurora Serverless v2 (writer + reader, 0.5 ACU floor, bursts) | 90-130 |
+| VPC interface endpoints (6-7 x 2 AZ)         | 90-100               |
+| WAF (web ACL + 3 rules + requests)           | 10                   |
 | Lambda + API Gateway + SQS                   | 10                   |
-| S3, KMS, Secrets Manager, CloudWatch         | 25                   |
-| **Infrastructure total**                     | **~355**             |
+| S3, KMS, Secrets Manager, CloudWatch, dashboard | 15                |
+| **Infrastructure total**                     | **~320-370**         |
 | NAT gateway (Gemini only)                    | +35                  |
 | LLM usage                                    | Depends on model and diff size; tracked in `analyses.llm_tokens` |
-
-A `small` sizing preset (single-AZ RDS `db.t4g.micro`, 1 worker, no WAF) is offered for small teams and evaluation, around 80 USD/month before LLM usage.
 
 ---
 
@@ -679,15 +712,15 @@ A `small` sizing preset (single-AZ RDS `db.t4g.micro`, 1 worker, no WAF) is offe
 
 | Area                        | Change                                                                                                          |
 | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `src/cli.js`                | `wlu ci` (collect, scan, redact, emit the payload), `wlu cloud deploy`, `wlu cloud destroy`.                    |
+| `src/cli.js`                | `wlu ci` (collect, scan, redact, emit the payload); later `wlu cloud deploy` / `destroy` wrapping the scripts. |
 | `src/llm/`                  | Move `src/gemini.js` behind a provider interface; add a Bedrock provider.                                       |
 | `src/policy.js`             | New. Pure policy resolution + decision function, shared by worker and CLI (`wlu gate` works fully offline).     |
 | `prompts/`                  | New `pr-consistency.md` and `release-consistency.md`; JSON output variant of `warnings.md`.                    |
-| `service/`                  | New. `api` Lambda handler, `worker` process, `maintenance` Lambda, DB migrations.                               |
-| `infra/terraform/`          | New. Root module, submodules, `deployer-policy.json`.                                                           |
+| `service/`                  | Placeholders today (`/healthz` only). `api` Lambda, `worker` (Lambda and EC2 entry points), `maintenance` Lambda, DB migrations. Shared by every cloud. |
+| `infra/aws_infraestructure/` | Written, not yet applied to an account: Terraform (root module + 8 submodules), `small` / `full` presets, `deploy.sh`, `destroy.sh`, `.env.example`, `deployer-policy.json`. `infra/gcp_*` later. |
 | `action/`                   | New. Composite action, published to `pato-byepaper/diffwise-action` by a release workflow.                       |
-| `.env.example`              | New AWS, Terraform and `DIFFWISE_*` entries (section 3.2).                                                      |
-| `.gitignore`                | Add `.terraform/`, `*.tfstate*`, `*.tfvars` (except examples).                                                  |
+| `infra/aws_infraestructure/.env.example` | AWS, Terraform and `DIFFWISE_*` entries (section 3.2). The root `.env.example` stays CLI-only.  |
+| `.gitignore`                | Done: `.terraform/`, `*.tfstate*`, `*.tfvars`, `tfplan`, `infra/*/build/`.                                      |
 | `README.md`, `SECURITY.md`  | Self-hosting guide and threat model; privacy promise unchanged.                                                 |
 | `test/`                     | Policy engine table tests, payload schema tests, redaction re-check tests, `terraform validate` + `tflint` in CI. |
 
@@ -700,7 +733,7 @@ Because `src/policy.js` is pure and shared, the same `.github/diffwise.yml` prod
 | Phase    | Scope                                                                                              | Exit criteria                                                        |
 | -------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | 0        | `wlu ci` + `src/policy.js`; Action in scanner-only mode (no AWS needed).                           | Teams can block on scanner findings with the policy file.            |
-| 1        | Terraform stack, warning analysis, `report` mode. Deployed to a test account and torn down cleanly. | `apply` and `destroy` succeed from an empty account; p95 target met. |
+| 1        | Terraform stack (`small` and `full`, written), warning analysis, `report` mode. Deployed to a test account and torn down cleanly. | `apply` and `destroy` succeed from an empty account for both types; p95 target met. |
 | 2        | Description and release cross-checks, overrides, sticky comment, `gate` mode.                      | Pilot teams make the check required; block false-positive rate under 5%. |
 | 3        | v2.0.0 release: docs, sizing presets, upgrade path tested from 2.0 to 2.1.                          | A new user goes from clone to first gated PR in under 30 minutes.    |
 | 4 (v2.1) | Optional GitHub App mode (webhooks into the same stack), merge queue support (`merge_group`).       | Org-wide rollout without per-repo workflow files.                    |
@@ -709,8 +742,9 @@ Because `src/policy.js` is pure and shared, the same `.github/diffwise.yml` prod
 
 ## 13. Open questions
 
-1. **Default LLM:** Bedrock as the default (no egress, stays in the account) and Gemini as opt-in, or the other way around to match the current CLI?
-2. **Release notes source of truth:** PR body section, a `CHANGELOG.md` entry, or a changeset file (`.changeset/*.md`)?
-3. **Override authority:** CODEOWNERS (works with the default `GITHUB_TOKEN`) or GitHub teams (needs `read:org`, so a GitHub App or extra token)?
-4. **Baseline policy home:** org `.github` repository, or a dedicated `diffwise-policy` repository?
-5. **Other clouds:** is there demand for GCP or Azure Terraform modules after v2?
+1. **Default deployment type:** `small` is the default in `.env.example`. Should the docs push larger orgs to `full` from day one?
+2. **Default LLM:** Bedrock as the default (no egress, stays in the account) and Gemini as opt-in, or the other way around to match the current CLI?
+3. **Release notes source of truth:** PR body section, a `CHANGELOG.md` entry, or a changeset file (`.changeset/*.md`)?
+4. **Override authority:** CODEOWNERS (works with the default `GITHUB_TOKEN`) or GitHub teams (needs `read:org`, so a GitHub App or extra token)?
+5. **Baseline policy home:** org `.github` repository, or a dedicated `diffwise-policy` repository?
+6. **Other clouds:** is there demand for GCP or Azure Terraform modules after v2?

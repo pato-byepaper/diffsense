@@ -5,3 +5,12 @@ node_modules/
 .DS_Store
 *.log
 coverage/
+
+# Terraform (infra/*)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+tfplan
+infra/*/build/
